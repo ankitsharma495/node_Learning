@@ -9,3 +9,4 @@ dist
 build
 coverage
 .idea
+src/config/config.json
