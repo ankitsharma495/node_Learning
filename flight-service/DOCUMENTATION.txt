@@ -1,0 +1,4045 @@
+================================================================================
+    AIRLINE BOOKING SYSTEM — COMPLETE CODEBASE DOCUMENTATION
+    Every file, every function, every line explained
+================================================================================
+
+Written: April 2, 2026
+Updated: April 3, 2026
+Covers: Phases 1–8 + Full Microservices Architecture
+
+TABLE OF CONTENTS:
+  1.  PROJECT OVERVIEW — What is this project?
+  2.  ARCHITECTURE — How is the code organized?
+  3.  THE REQUEST LIFECYCLE — What happens when a request comes in?
+  4.  FILE-BY-FILE BREAKDOWN — Every file explained line by line
+  5.  PHASE 1 CHANGELOG — What bugs were fixed, what was added
+  6.  PHASE 2 CHANGELOG — How logging was added
+  7.  API REFERENCE — Every endpoint available
+  8.  ERROR HANDLING FLOW — How errors propagate through layers
+  9.  PHASE 8 CHANGELOG — API Gateway features added to Flight Service
+  10. MICROSERVICES ARCHITECTURE — How we split the monolith into services
+  11. AUTH SERVICE — User signup, login, JWT tokens (line-by-line)
+  12. BOOKING SERVICE — Flight booking with inter-service calls (line-by-line)
+  13. API GATEWAY — Reverse proxy, JWT middleware, routing (line-by-line)
+  14. INTER-SERVICE COMMUNICATION — How services talk to each other
+  15. ALTERNATIVES & TRADE-OFFS — What else we could have done
+  16. WHAT COULD GO WRONG — Failure modes and edge cases
+  17. JUNIOR DEVELOPER MISTAKES — Common pitfalls and how to avoid them
+  18. HOW WE BUILT IT — Step-by-step build narrative
+
+
+================================================================================
+1. PROJECT OVERVIEW — What is this project?
+================================================================================
+
+This is an Airline Booking System built with a true microservices architecture.
+The system is now split into four independent services, each with its own
+process, dependencies, and database:
+
+  1. Flight Service   (Port 3000, DB: Flights)
+    - Manages airplanes, flights, airports, cities
+    - Provides advanced flight filtering and seat inventory updates
+
+  2. Booking Service  (Port 3002, DB: Booking_DB)
+    - Creates and cancels bookings
+    - Calls Flight Service to verify availability and update seats
+
+  3. Auth Service     (Port 3003, DB: Auth_DB)
+    - Handles signup, login, and JWT token verification
+
+  4. API Gateway      (Port 3001, no DB)
+    - Single entry point for clients
+    - Verifies JWT tokens and routes traffic to services
+
+Note: The original monolith lives in the `node_Learning` folder for reference.
+The active microservices live in `Airline-Booking-System/`.
+
+
+================================================================================
+2. ARCHITECTURE — How is the code organized?
+================================================================================
+
+The code follows a LAYERED ARCHITECTURE pattern. Each layer has ONE job:
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                        CLIENT (Postman, Browser, Frontend)      │
+  │                        Sends HTTP requests to the server        │
+  └─────────────────────┬───────────────────────────────────────────┘
+                        │
+                        ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  ROUTES LAYER  (src/routes/)                                    │
+  │  Job: Map URLs to the right controller function                 │
+  │  Example: POST /api/v1/airplanes → createAirplane()             │
+  └─────────────────────┬───────────────────────────────────────────┘
+                        │
+                        ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  MIDDLEWARE LAYER  (src/middlewares/)                            │
+  │  Job: Validate the request BEFORE it reaches the controller     │
+  │  Example: Check that "capacity" is a positive integer           │
+  │  If invalid → returns 400 Bad Request, controller never runs    │
+  │  If valid   → calls next(), request continues to controller     │
+  └─────────────────────┬───────────────────────────────────────────┘
+                        │
+                        ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  CONTROLLER LAYER  (src/controllers/)                           │
+  │  Job: Handle HTTP — extract data from request, call service,    │
+  │       format the response with proper status code               │
+  │  Does NOT contain business logic or database queries            │
+  └─────────────────────┬───────────────────────────────────────────┘
+                        │
+                        ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  SERVICE LAYER  (src/services/)                                 │
+  │  Job: Business logic. Currently thin (pass-through), but will   │
+  │       grow as rules are added (e.g., "can't create duplicate    │
+  │       airplane", "capacity must be within manufacturer specs")  │
+  └─────────────────────┬───────────────────────────────────────────┘
+                        │
+                        ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  REPOSITORY LAYER  (src/repositories/)                          │
+  │  Job: Talk to the database. Translate app operations into       │
+  │       Sequelize ORM calls (which become SQL queries)            │
+  └─────────────────────┬───────────────────────────────────────────┘
+                        │
+                        ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  MODEL LAYER  (src/models/)                                     │
+  │  Job: Define the database table structure. What columns exist,  │
+  │       what types they are, what constraints they have            │
+  └─────────────────────┬───────────────────────────────────────────┘
+                        │
+                        ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  DATABASE  (MySQL)                                              │
+  │  The actual tables where data is stored on disk                 │
+  └─────────────────────────────────────────────────────────────────┘
+
+WHY LAYERS?
+  - Each layer can be changed independently without breaking others
+  - You can swap MySQL for PostgreSQL by only changing the repository/model
+  - You can add business rules without touching the database code
+  - Testing is easier — you can test each layer in isolation
+
+
+================================================================================
+3. THE REQUEST LIFECYCLE — What happens when a request comes in?
+================================================================================
+
+Let's trace a COMPLETE request from client to database and back.
+
+EXAMPLE: POST /api/v1/airplanes  with body: { "modelNumber": "A320", "capacity": 180 }
+
+STEP 1 — Express receives the request
+  File: src/index.js
+  Line: app.use('/api', apirouter)
+  
+  Express sees the URL starts with "/api", so it passes the request
+  to the "apirouter" (which is src/routes/index.js).
+  
+  The remaining URL after stripping "/api" is: /v1/airplanes
+
+STEP 2 — Routes layer matches the URL
+  File: src/routes/index.js
+  Line: router.use('/v1', v1routes)
+  
+  Express sees the URL starts with "/v1", strips it, passes to v1routes.
+  Remaining URL: /airplanes
+  
+  File: src/routes/v1/index.js
+  Line: router.use('/airplanes', airplaneRoutes)
+  
+  Express sees "/airplanes", strips it, passes to airplaneRoutes.
+  Remaining URL: /  (just the root)
+  
+  File: src/routes/v1/airplane-routes.js
+  Line: router.post('/', AirplaneMiddleware.validateCreateRequest, Airplanecontroller.createAirplane)
+  
+  Express matches: method is POST, path is "/". 
+  It sees TWO functions to run in order:
+    1. AirplaneMiddleware.validateCreateRequest  (middleware)
+    2. Airplanecontroller.createAirplane         (controller)
+
+STEP 3 — Middleware validates the request
+  File: src/middlewares/airplane-middleware.js
+  Function: validateCreateRequest(req, res, next)
+  
+  Checks req.body.modelNumber → "A320" exists → PASS
+  Checks req.body.capacity → 180 is a positive integer → PASS
+  Logs: "Middleware: validateCreateRequest passed"
+  Calls next() → Express runs the next function (the controller)
+
+STEP 4 — Controller processes the request
+  File: src/controllers/airplane-controller.js
+  Function: createAirplane(req, res)
+  
+  Logs: "Controller: createAirplane request received"
+  Extracts data from req.body: { modelNumber: "A320", capacity: 180 }
+  Calls: AirplaneService.createAirplane({ modelNumber: "A320", capacity: 180 })
+  Waits for the result...
+
+STEP 5 — Service runs business logic
+  File: src/services/airplaneService.js
+  Function: createAirplane(data)
+  
+  Logs: "Airplane service: createAirplane called"
+  Currently no business logic — just passes data to repository.
+  Calls: airplaneRepository.create(data)
+  Waits for the result...
+
+STEP 6 — Repository talks to database
+  File: src/repositories/crud-repository.js
+  Function: create(data)
+  
+  Calls: this.model.create(data)
+  "this.model" is the Airplane Sequelize model (set in constructor).
+  
+  Sequelize translates this into SQL:
+    INSERT INTO `Airplanes` (`id`, `modelNumber`, `capacity`, `createdAt`, `updatedAt`)
+    VALUES (DEFAULT, 'A320', 180, '2026-04-02 10:30:00', '2026-04-02 10:30:00');
+  
+  MySQL executes the SQL and returns the created row.
+  Sequelize wraps it in an Airplane model instance.
+  
+  Logs: "Successfully created a resource"
+  Returns the airplane object back to the service.
+
+STEP 7 — Response travels back up
+
+  Service receives the airplane → returns it to controller
+  Controller receives the airplane → logs success → sends HTTP response:
+  
+  HTTP/1.1 201 Created
+  Content-Type: application/json
+  
+  {
+    "success": true,
+    "message": "Successfully created an airplane",
+    "data": {
+      "id": 1,
+      "modelNumber": "A320",
+      "capacity": 180,
+      "createdAt": "2026-04-02T10:30:00.000Z",
+      "updatedAt": "2026-04-02T10:30:00.000Z"
+    },
+    "error": {}
+  }
+
+COMPLETE LOG OUTPUT for this request:
+  info: Middleware: validateCreateRequest passed
+  info: Controller: createAirplane request received {"body":{"modelNumber":"A320","capacity":180}}
+  info: Airplane service: createAirplane called {"data":{"modelNumber":"A320","capacity":180}}
+  info: Successfully created a resource
+  info: Controller: createAirplane success {"id":1}
+
+
+================================================================================
+4. FILE-BY-FILE BREAKDOWN — Every file explained line by line
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: package.json
+PURPOSE: Defines the project — its name, dependencies, and runnable scripts.
+────────────────────────────────────────────────────────────────────────────────
+
+{
+  "name": "node_learning",           ← Project name (used by npm)
+  "version": "1.0.0",               ← Semantic version of the project
+  "type": "commonjs",               ← Uses require()/module.exports (not import/export)
+  "main": "index.js",               ← Default entry point when someone does require('node_learning')
+  
+  "scripts": {
+    "dev": "nodemon src/index.js",
+      ↑ Runs the server with nodemon. Nodemon watches for file changes
+        and auto-restarts the server. You run this with: npm run dev
+    
+    "migration:gen": "cd src && npx sequelize-cli migration:generate --name",
+      ↑ Creates a new empty migration file. Usage: npm run migration:gen -- create-city
+        This creates a file in src/migrations/ with a timestamp prefix.
+    
+    "migration:run": "cd src && npx sequelize-cli db:migrate",
+      ↑ Runs all pending migrations (creates/modifies tables in the database).
+        Sequelize tracks which migrations have run in a SequelizeMeta table.
+    
+    "migration:undo": "cd src && npx sequelize-cli db:migrate:undo"
+      ↑ Reverts the LAST migration (drops the table it created).
+  },
+  
+  "dependencies": {
+    "bcrypt": "^6.0.0",              ← Password hashing library (not used yet, for Auth Service)
+    "dotenv": "^17.3.1",             ← Loads .env file variables into process.env
+    "express": "^5.2.1",             ← Web framework — handles HTTP requests/responses
+    "http-status-codes": "^2.3.0",   ← Named constants for HTTP status codes (200, 404, 500 etc.)
+    "mysql2": "^3.20.0",             ← MySQL driver — lets Node.js talk to MySQL database
+    "nodemon": "^3.1.14",            ← Auto-restarts server on file changes (dev tool)
+    "sequelize": "^6.37.8",          ← ORM — lets you use JavaScript objects instead of raw SQL
+    "sequelize-cli": "^6.6.5",       ← CLI tool for Sequelize — generates models, migrations, seeds
+    "winston": "^3.19.0"             ← Logging library — structured logs with levels, files, timestamps
+  }
+}
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/index.js
+PURPOSE: The ENTRY POINT of the entire application. Sets up Express, mounts
+         routes, and starts listening for HTTP requests.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: const express = require('express');
+  → Imports the Express library. Express is a web framework that creates
+    an HTTP server and provides routing, middleware, and request/response
+    handling. Without Express, you'd need to use Node's raw http module
+    and manually parse URLs, headers, and body data.
+
+LINE: const app = express();
+  → Creates an Express APPLICATION instance. This object IS the server.
+    It stores all routes, middleware, and settings. You attach everything
+    to this object, then call app.listen() to start it.
+
+LINE: const { serverConfig, Logger } = require('./config');
+  → Imports from the config barrel export:
+    - serverConfig: Contains PORT from .env file
+    - Logger: The Winston logger instance (singleton — same object everywhere)
+    
+    DESTRUCTURING SYNTAX: { serverConfig, Logger } = require(...)
+    This is JavaScript destructuring. It's equivalent to:
+      const config = require('./config');
+      const serverConfig = config.serverConfig;
+      const Logger = config.Logger;
+
+LINE: const apirouter = require('./routes');
+  → Imports the main route handler from src/routes/index.js.
+    This contains all sub-routes (v1/airplanes, v1/info, etc.)
+
+LINE: app.use(express.json());
+  → MIDDLEWARE: Tells Express to parse incoming JSON request bodies.
+    When a client sends:
+      POST /api/v1/airplanes
+      Content-Type: application/json
+      {"modelNumber": "A320", "capacity": 180}
+    
+    Express.json() parses that JSON string and puts the result in req.body.
+    WITHOUT this line, req.body would be UNDEFINED.
+    
+    HOW IT WORKS INTERNALLY:
+    1. Express checks the Content-Type header
+    2. If it's "application/json", it reads the raw body (a Buffer)
+    3. It calls JSON.parse() on the raw string
+    4. It sets req.body = the parsed JavaScript object
+    5. It calls next() to continue to the next middleware
+
+LINE: app.use(express.urlencoded({extended:true}));
+  → MIDDLEWARE: Parses URL-encoded form data (like HTML <form> submissions).
+    When a client sends:
+      POST /api/v1/airplanes
+      Content-Type: application/x-www-form-urlencoded
+      modelNumber=A320&capacity=180
+    
+    This middleware parses it into req.body = { modelNumber: "A320", capacity: "180" }
+    
+    {extended: true} means it uses the "qs" library for parsing, which supports
+    nested objects like: user[name]=John → { user: { name: "John" } }
+    If extended were false, it uses the simpler "querystring" parser.
+
+LINE: app.use('/api', apirouter);
+  → ROUTE MOUNTING: All routes defined in apirouter will be prefixed with "/api".
+    So if apirouter has a route for "/v1/airplanes", the full URL becomes
+    "/api/v1/airplanes".
+    
+    app.use() with a path prefix strips that prefix before passing to the router.
+    When a request for "/api/v1/airplanes" comes in:
+    1. Express sees it starts with "/api" → matches this middleware
+    2. Strips "/api" from the URL → remaining: "/v1/airplanes"
+    3. Passes the request (with shortened URL) to apirouter
+
+LINE: app.listen(serverConfig.PORT, () => { ... });
+  → STARTS THE SERVER. This tells Node.js to:
+    1. Create a TCP server on the specified port
+    2. Start accepting incoming HTTP connections
+    3. Run the callback function when the server is ready
+    
+    The callback logs: "Server started successfully on port 3000"
+    This only runs ONCE, when the server first boots.
+    
+    If PORT is undefined (no .env file), Node will pick a random port.
+    If PORT is already in use, this will throw an EADDRINUSE error.
+
+LINE: Logger.info(`Server started successfully on port ${serverConfig.PORT}`);
+  → Uses template literal (backticks) to embed the port number in the message.
+    This log goes to:
+    - Console (colorized, green "info" prefix) — in development
+    - logs/combined.log (JSON format with timestamp)
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/config/server-config.js
+PURPOSE: Loads environment variables from .env file and exports them.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: const dotenv = require('dotenv');
+  → Imports the dotenv library. dotenv reads a file named ".env" in the
+    project root and loads its key=value pairs into process.env.
+
+LINE: dotenv.config();
+  → Actually reads the .env file and loads variables.
+    If .env contains: PORT=3000
+    After this line: process.env.PORT === "3000" (always a string)
+    
+    If there is NO .env file, this does nothing (doesn't crash).
+    If a variable is already set in the system environment, dotenv
+    does NOT overwrite it (system env takes priority).
+
+LINE: module.exports = { PORT: process.env.PORT }
+  → Exports an object with the PORT value. Other files import this as:
+    const { serverConfig } = require('./config');
+    serverConfig.PORT → "3000"
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/config/logger-config.js
+PURPOSE: Creates and configures a Winston logger instance used throughout
+         the entire application for structured, leveled logging.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: const winston = require('winston');
+  → Imports the Winston logging library. Winston provides:
+    - Severity levels (error, warn, info, http, debug, verbose, silly)
+    - Multiple output destinations (console, file, HTTP, database)
+    - Customizable formatting (JSON, simple text, colorized)
+    - Timestamp injection
+
+LINE: const logger = winston.createLogger({ ... });
+  → Creates a LOGGER INSTANCE. This is the main object you use to log.
+    createLogger() takes a configuration object with:
+    - level: minimum severity to log
+    - format: how logs are formatted
+    - transports: where logs are sent
+
+  INSIDE THE CONFIG:
+
+  level: 'info'
+    → Sets the minimum severity. Only messages at this level or higher
+      (more severe) are logged.
+      
+      Winston severity levels (built-in):
+        error: 0  ← most severe (ALWAYS logged)
+        warn:  1
+        info:  2  ← this is our threshold
+        http:  3  ← NOT logged (below threshold)
+        verbose: 4 ← NOT logged
+        debug: 5  ← NOT logged
+        silly: 6  ← NOT logged (least severe)
+      
+      So Logger.info("hello")  → LOGGED
+         Logger.error("crash") → LOGGED (more severe than info)
+         Logger.debug("x=5")   → IGNORED (less severe than info)
+
+  format: winston.format.combine(...)
+    → combine() chains multiple format transformers. Each one modifies
+      the log "info" object, then passes it to the next.
+      
+      winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' })
+        → Adds a "timestamp" field to every log entry.
+          Before: { level: 'info', message: 'hello' }
+          After:  { level: 'info', message: 'hello', timestamp: '2026-04-02 10:30:00' }
+      
+      winston.format.json()
+        → Converts the entire log object to a JSON string for output.
+          Output: {"level":"info","message":"hello","timestamp":"2026-04-02 10:30:00"}
+
+  transports: [ ... ]
+    → Transports are OUTPUT DESTINATIONS. Each transport independently
+      receives the formatted log and writes it somewhere.
+      
+      new winston.transports.File({ filename: 'logs/combined.log' })
+        → Writes ALL logs (at the configured level and above) to this file.
+          The file is created automatically. It grows over time — each log
+          is appended to the end. In production, you'd rotate these files
+          (delete old ones) using winston-daily-rotate-file transport.
+      
+      new winston.transports.File({ filename: 'logs/error.log', level: 'error' })
+        → Writes ONLY error-level logs to this file. The "level: 'error'"
+          on this transport OVERRIDES the logger-level setting. Even though
+          the logger is set to 'info', this transport only accepts 'error'.
+          
+          This is a common pattern: keep ALL logs in combined.log for
+          full tracing, but also keep errors in a separate file for
+          quick access when debugging production issues.
+
+  CONDITIONAL CONSOLE TRANSPORT:
+  
+  if (process.env.NODE_ENV !== 'production') { ... }
+    → In development, also log to the terminal console.
+      In production, console output is often unnecessary because logs
+      go to file-based or cloud-based aggregators.
+      
+      winston.format.colorize()
+        → Colors the output based on level:
+          error → red
+          warn  → yellow  
+          info  → green
+          This makes it easy to scan the terminal for errors.
+      
+      winston.format.simple()
+        → Formats output as: "level: message"
+          Example: "info: Server started on port 3000"
+          This is human-readable (unlike JSON format used in files).
+
+LINE: module.exports = logger;
+  → Exports the logger instance. Because Node.js CACHES module exports,
+    every file that requires this module gets the SAME logger object.
+    This is a SINGLETON pattern — one logger for the whole app.
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/config/index.js
+PURPOSE: Barrel export — re-exports all config modules from one place.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: const serverConfig = require("./server-config");
+  → Imports the { PORT } object from server-config.js
+
+LINE: const Logger = require("./logger-config");
+  → Imports the Winston logger singleton
+
+LINE: module.exports = { serverConfig, Logger }
+  → Exports both. Any file can now do:
+    const { serverConfig, Logger } = require('../config');
+    
+    Without this barrel export, files would need two separate requires:
+      const serverConfig = require('../config/server-config');
+      const Logger = require('../config/logger-config');
+    
+    The barrel pattern keeps imports clean and centralized.
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/config/config.json
+PURPOSE: Sequelize database connection settings for different environments.
+────────────────────────────────────────────────────────────────────────────────
+
+This file has THREE sections: development, test, production.
+Sequelize reads this file to know HOW to connect to the database.
+
+"development" section:
+  "username": "root"         ← MySQL username
+  "password": "ankit0709"    ← MySQL password (NOTE: should be in .env, not here)
+  "database": "Flights"      ← Database name in MySQL  
+  "host": "127.0.0.1"        ← Database host (localhost)
+  "dialect": "mysql"         ← Which SQL database engine (mysql, postgres, sqlite, etc.)
+
+Sequelize picks the section based on NODE_ENV environment variable.
+If NODE_ENV is not set, it defaults to "development".
+
+HOW THIS FILE IS USED:
+  In src/models/index.js:
+    const env = process.env.NODE_ENV || 'development';
+    const config = require('../config/config.json')[env];
+    new Sequelize(config.database, config.username, config.password, config);
+  
+  This creates a Sequelize connection to: mysql://root:ankit0709@127.0.0.1/Flights
+
+SECURITY NOTE: The password is hardcoded. In a real project, this should use
+environment variables via dotenv. This is flagged for Phase 5 (Environment & Security).
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/models/index.js
+PURPOSE: Auto-discovers and loads ALL Sequelize model files in the models/ folder.
+         Sets up the database connection and runs model associations.
+         This is the STANDARD file generated by sequelize-cli init.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: const fs = require('fs');
+  → Node.js file system module. Used to read the models directory.
+
+LINE: const path = require('path');
+  → Node.js path module. Used to join file paths cross-platform.
+
+LINE: const Sequelize = require('sequelize');
+  → The Sequelize ORM library.
+
+LINE: const basename = path.basename(__filename);
+  → Gets the filename of THIS file: "index.js"
+    Used later to skip itself when scanning for model files.
+
+LINE: const env = process.env.NODE_ENV || 'development';
+  → Determines which environment we're in. Defaults to 'development'.
+
+LINE: const config = require(__dirname + '/../config/config.json')[env];
+  → Loads the database config for the current environment.
+    In development: { username: "root", password: "ankit0709", database: "Flights", ... }
+
+LINE: const db = {};
+  → An empty object that will hold all model classes. Eventually:
+    db = { Airplane: AirplaneModel, sequelize: connection, Sequelize: library }
+
+LINE: let sequelize;
+  → Declares the database connection variable.
+
+LINE: if (config.use_env_variable) { ... } else { ... }
+  → Two ways to connect to the database:
+    1. Via an environment variable name (e.g., DATABASE_URL) — used in production
+    2. Via individual config values (username, password, etc.) — used in development
+    Our config.json doesn't have use_env_variable, so we use option 2:
+    
+    sequelize = new Sequelize(config.database, config.username, config.password, config);
+    → Creates a connection pool to MySQL. Does NOT connect yet — 
+      connection happens on first query.
+      Parameters: Sequelize('Flights', 'root', 'ankit0709', { host: '127.0.0.1', dialect: 'mysql' })
+
+LINE: fs.readdirSync(__dirname).filter(...).forEach(...)
+  → This is the AUTO-DISCOVERY mechanism:
+    
+    1. fs.readdirSync(__dirname)
+       Reads all files in src/models/: ["airplane.js", "index.js"]
+    
+    2. .filter(file => ...)
+       Filters out:
+       - Files starting with "." (hidden files like .gitkeep)
+       - This file itself ("index.js") — so it doesn't try to load itself
+       - Non-.js files
+       - Test files (*.test.js)
+       Remaining: ["airplane.js"]
+    
+    3. .forEach(file => ...)
+       For each model file:
+       - require(path.join(__dirname, file)) → loads src/models/airplane.js
+       - That file exports a FUNCTION: (sequelize, DataTypes) => Airplane class
+       - We call that function: modelFunction(sequelize, Sequelize.DataTypes)
+       - This returns the Airplane class, registered with our connection
+       - We store it: db['Airplane'] = AirplaneClass
+    
+    WHY THIS PATTERN?
+    When you add a new model (e.g., Flight), you just create the file.
+    You don't need to manually import it anywhere — this loop finds it automatically.
+
+LINE: Object.keys(db).forEach(modelName => { if (db[modelName].associate) ... })
+  → Runs the "associate" method on every model (if it exists).
+    This is where you define RELATIONSHIPS between models:
+    - Airplane.hasMany(Flight)
+    - Flight.belongsTo(Airplane)
+    Currently, Airplane.associate() is empty (no relationships yet).
+
+LINE: db.sequelize = sequelize;
+  → Stores the connection instance so other files can use it for
+    raw queries, transactions, etc.
+
+LINE: db.Sequelize = Sequelize;
+  → Stores the Sequelize library itself (useful for accessing DataTypes,
+    Op operators, etc.)
+
+LINE: module.exports = db;
+  → Exports: { Airplane: AirplaneModel, sequelize: connection, Sequelize: library }
+    Other files import specific models: const { Airplane } = require('../models');
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/models/airplane.js
+PURPOSE: Defines the Airplane model — the JavaScript representation of the
+         "Airplanes" table in MySQL.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: const { Model } = require('sequelize');
+  → Imports Sequelize's base Model class. All models extend this.
+
+LINE: module.exports = (sequelize, DataTypes) => { ... };
+  → Exports a FUNCTION (not a class). This function receives:
+    - sequelize: the database connection (from models/index.js)
+    - DataTypes: Sequelize type definitions (STRING, INTEGER, BOOLEAN, etc.)
+    
+    This pattern lets models/index.js control WHEN and HOW models are initialized.
+    The model doesn't create its own connection — it receives one.
+
+LINE: class Airplane extends Model { ... }
+  → Creates a JavaScript class that represents one row in the Airplanes table.
+    Every instance of Airplane IS one row.
+    Example: const plane = await Airplane.findByPk(1);
+    plane.modelNumber → "A320"
+    plane.capacity → 180
+
+LINE: static associate(models) { }
+  → A hook method called by models/index.js to define relationships.
+    Currently empty. Will be filled when Flight model is created:
+    Airplane.hasMany(models.Flight)
+
+LINE: Airplane.init({ modelNumber: DataTypes.STRING, capacity: DataTypes.INTEGER }, { ... });
+  → Defines the COLUMNS of the Airplanes table:
+    - modelNumber: STRING → VARCHAR(255) in MySQL
+    - capacity: INTEGER → INT in MySQL
+    
+    The second argument { sequelize, modelName: 'Airplane' } tells Sequelize:
+    - Which connection to use
+    - The model name (used to derive table name: 'Airplane' → 'Airplanes')
+    
+    Sequelize automatically adds: id, createdAt, updatedAt columns.
+
+LINE: return Airplane;
+  → Returns the configured model class to models/index.js, which stores
+    it in the db object.
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/migrations/20260329111835-create-airplane.js
+PURPOSE: Database migration — creates the Airplanes table in MySQL.
+         Migrations are VERSION CONTROL for your database schema.
+────────────────────────────────────────────────────────────────────────────────
+
+WHAT IS A MIGRATION?
+  A migration is a JavaScript file that describes ONE change to the database.
+  It has TWO directions:
+    - up():   Apply the change   (create the table)
+    - down(): Reverse the change (drop the table)
+  
+  Migrations run IN ORDER (by timestamp in filename). Sequelize tracks which
+  have run in a special table called "SequelizeMeta".
+  
+  WHY NOT JUST CREATE TABLES MANUALLY?
+    - Team members need the same database structure
+    - You can't "undo" a manual SQL change
+    - In production, you need automated, repeatable deployments
+    - Migrations are code — they go in Git, get reviewed, versioned
+
+THE FILENAME: 20260329111835-create-airplane.js
+  → 20260329111835 = year-month-day-hour-minute-second
+    Sequelize runs migrations in chronological order by this timestamp.
+
+LINE: async up(queryInterface, Sequelize) { ... }
+  → The "forward" direction. Creates the table.
+  
+  queryInterface: A Sequelize object that provides methods to modify
+    the database schema (createTable, addColumn, removeColumn, etc.)
+  
+  await queryInterface.createTable('Airplanes', { ... })
+  → Generates and runs SQL:
+    CREATE TABLE `Airplanes` (
+      `id` INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      `modelNumber` VARCHAR(255) NOT NULL,
+      `capacity` INTEGER NOT NULL,
+      `createdAt` DATETIME NOT NULL,
+      `updatedAt` DATETIME NOT NULL
+    );
+
+  Column definitions:
+    id:          Auto-incrementing primary key. Every row gets a unique ID.
+    modelNumber: String, NOT NULL (required — can't insert without it).
+    capacity:    Integer, NOT NULL (required).
+    createdAt:   Automatically set by Sequelize when a row is created.
+    updatedAt:   Automatically updated by Sequelize when a row is modified.
+
+LINE: async down(queryInterface, Sequelize) { ... }
+  → The "reverse" direction.
+  
+  await queryInterface.dropTable('Airplanes')
+  → Generates: DROP TABLE `Airplanes`;
+    Completely removes the table and all its data. DESTRUCTIVE.
+    Used when you run: npm run migration:undo
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/repositories/crud-repository.js
+PURPOSE: A GENERIC base repository that provides Create, Read, Update, Delete
+         operations for ANY Sequelize model. Other repositories extend this.
+────────────────────────────────────────────────────────────────────────────────
+
+WHY A BASE CLASS?
+  Every model needs the same basic operations: create, get, getAll, update, destroy.
+  Instead of writing these 5 methods in AirplaneRepository, CityRepository,
+  FlightRepository, etc. (copy-paste), we write them ONCE here.
+  Other repositories inherit them via: class AirplaneRepository extends CrudRepository
+
+LINE: const { Logger } = require('../config');
+  → Imports the Winston logger for logging database operations.
+
+LINE: class CrudRepository { ... }
+  → A JavaScript class. Uses ES6 class syntax (syntactic sugar over prototypes).
+
+LINE: constructor(model) { this.model = model; }
+  → The constructor runs when you do: new CrudRepository(SomeModel)
+    It stores the Sequelize model (e.g., Airplane) on the instance.
+    All methods use this.model to perform queries.
+    
+    Example: new CrudRepository(Airplane)
+      → this.model = Airplane
+      → this.model.create(data) = Airplane.create(data)
+
+METHOD: async create(data)
+  → Creates a new row in the database.
+  
+  INPUT: data = { modelNumber: "A320", capacity: 180 }
+  
+  const response = await this.model.create(data);
+    → Sequelize generates SQL:
+      INSERT INTO `Airplanes` (`id`,`modelNumber`,`capacity`,`createdAt`,`updatedAt`)
+      VALUES (DEFAULT,'A320',180,'2026-04-02 10:30:00','2026-04-02 10:30:00');
+    → Returns: An Airplane instance with all fields (including id, createdAt, updatedAt)
+  
+  Logger.info('Successfully created a resource');
+    → Logs success. Goes to console + logs/combined.log
+  
+  return response;
+    → Returns the created model instance to the caller (service layer).
+  
+  ON ERROR: If the INSERT fails (e.g., NOT NULL constraint violation):
+    Logger.error('Error in create repository layer', { error: error.message });
+    throw error;
+    → Logs the error, then re-throws it. The error bubbles up to:
+      service → controller → HTTP 500 response.
+
+METHOD: async destroy(data)
+  → Deletes a row by its primary key (id).
+  
+  INPUT: data = 5  (the id to delete)
+  
+  const response = await this.model.destroy({ where: { id: data } });
+    → Sequelize generates SQL:
+      DELETE FROM `Airplanes` WHERE `id` = 5;
+    → Returns: An INTEGER — the number of rows deleted.
+      - Returns 1 if the row existed and was deleted
+      - Returns 0 if no row with that id existed
+  
+  The controller checks: if (response === 0) → return 404 Not Found
+
+METHOD: async get(data)
+  → Fetches ONE row by its primary key.
+  
+  INPUT: data = 3  (the id to find)
+  
+  const response = await this.model.findByPk(data);
+    → Sequelize generates SQL:
+      SELECT `id`, `modelNumber`, `capacity`, `createdAt`, `updatedAt`
+      FROM `Airplanes` WHERE `id` = 3;
+    → Returns: An Airplane instance, or NULL if not found.
+  
+  The controller checks: if (!airplane) → return 404 Not Found
+
+  BUG FIXED IN PHASE 1: Originally this was this.model.findByPk() with NO
+  argument. findByPk(undefined) always returns null. We fixed it to pass data.
+
+METHOD: async getAll()
+  → Fetches ALL rows from the table.
+  
+  const response = await this.model.findAll();
+    → Sequelize generates SQL:
+      SELECT `id`, `modelNumber`, `capacity`, `createdAt`, `updatedAt`
+      FROM `Airplanes`;
+    → Returns: An array of Airplane instances. Empty array if table is empty.
+
+METHOD: async update(data, id)
+  → Updates specific fields on a row.
+  
+  INPUT: data = { capacity: 200 }, id = 3
+  
+  const response = await this.model.update(data, { where: { id: id } });
+    → Sequelize generates SQL:
+      UPDATE `Airplanes` SET `capacity` = 200, `updatedAt` = '2026-04-02 11:00:00'
+      WHERE `id` = 3;
+    → Returns: An array [affectedCount] — e.g., [1] if one row was updated.
+      - [0] means no row with that id exists.
+  
+  NOTE: Sequelize automatically updates the `updatedAt` column.
+  
+  The controller checks: if (response[0] === 0) → return 404 Not Found
+
+LINE: module.exports = CrudRepository;
+  → Exports the class so other repositories can extend it.
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/repositories/airplane-repository.js
+PURPOSE: Repository specifically for Airplane operations. Inherits all 5 CRUD
+         methods from CrudRepository. Can add airplane-specific queries later.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: const CrudRepository = require('./crud-repository');
+  → Imports the base class.
+
+LINE: const { Airplane } = require('../models');
+  → Imports the Airplane model from models/index.js auto-discovery.
+    Destructuring: { Airplane } = { Airplane: AirplaneClass, sequelize: ..., Sequelize: ... }
+
+LINE: class AirplaneRepository extends CrudRepository { ... }
+  → "extends" means AirplaneRepository INHERITS from CrudRepository.
+    It gets all 5 methods (create, destroy, get, getAll, update) for free.
+    
+    extends sets up the PROTOTYPE CHAIN:
+    AirplaneRepository.prototype → CrudRepository.prototype → Object.prototype
+    
+    When you call airplaneRepository.create(data):
+    1. JavaScript looks for "create" on AirplaneRepository → not found
+    2. Looks on CrudRepository → FOUND → runs it
+    3. Inside CrudRepository.create(), this.model = Airplane (set by constructor)
+    4. So it calls Airplane.create(data)
+
+LINE: constructor() { super(Airplane); }
+  → super() calls the PARENT class constructor: CrudRepository(Airplane)
+    This sets this.model = Airplane.
+    
+    WHY super()?
+    In JavaScript, if a class extends another, its constructor MUST call
+    super() before using "this". It initializes the parent class's properties.
+
+LINE: module.exports = AirplaneRepository;
+  → Exports the class. The service layer creates an instance:
+    const airplaneRepository = new AirplaneRepository();
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/repositories/index.js
+PURPOSE: Barrel export for repositories.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: const AirplaneRepository = require("./airplane-repository");
+LINE: module.exports = { AirplaneRepository }
+  → Lets other files do: const { AirplaneRepository } = require('../repositories');
+    As new repositories are added (CityRepository, AirportRepository, etc.),
+    they'll be added here.
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/services/airplaneService.js
+PURPOSE: Business logic layer for Airplane operations. Currently thin
+         (pass-through to repository), but will grow as rules are added.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: const { AirplaneRepository } = require('../repositories');
+  → Imports the repository class.
+
+LINE: const { Logger } = require('../config');
+  → Imports the Winston logger.
+
+LINE: const airplaneRepository = new AirplaneRepository();
+  → Creates ONE instance of AirplaneRepository.
+    This happens AT MODULE LOAD TIME (when the server starts).
+    The same instance is reused for all requests — it's stateless.
+    
+    IMPORTANT: This is NOT inside a function. It runs once when Node.js
+    first requires this file. The instance is shared across all requests.
+
+FUNCTION: async function createAirplane(data) { ... }
+  → Called by the controller. Receives the airplane data.
+  
+  FLOW:
+  1. Logger.info() → logs that the function was called, with the data
+  2. airplaneRepository.create(data) → calls CrudRepository.create()
+     which calls Airplane.create() which runs INSERT SQL
+  3. Returns the created airplane object
+  
+  ON ERROR:
+  - Logger.error() → logs the error
+  - throw error → re-throws to the controller
+  
+  WHY THE TRY/CATCH HERE?
+  Even though the repository ALSO has try/catch, the service catches errors
+  to log at the SERVICE level. Each layer logs its own errors, creating a
+  trace. The error is always re-thrown so it keeps bubbling up.
+
+FUNCTION: async function getAirplanes() { ... }
+  → Calls airplaneRepository.getAll() → returns array of all airplanes.
+    No parameters needed — it fetches everything.
+
+FUNCTION: async function getAirplane(id) { ... }
+  → Calls airplaneRepository.get(id) → returns one airplane or null.
+    The controller checks for null and returns 404 if needed.
+
+FUNCTION: async function updateAirplane(id, data) { ... }
+  → NOTE: Parameter order is (id, data) here but repository expects (data, id).
+    So it calls: airplaneRepository.update(data, id) — swapping the order.
+    This is intentional — the service has a more intuitive API (id first),
+    while the repository matches Sequelize's update(values, options) pattern.
+
+FUNCTION: async function destroyAirplane(id) { ... }
+  → Calls airplaneRepository.destroy(id) → returns number of deleted rows.
+
+LINE: module.exports = { createAirplane, getAirplanes, getAirplane, updateAirplane, destroyAirplane };
+  → Exports all 5 functions as named exports. The controller uses:
+    const { AirplaneService } = require('../services');
+    AirplaneService.createAirplane(data);
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/services/index.js
+PURPOSE: Barrel export for services.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: module.exports = { AirplaneService: require('./airplaneService') }
+  → Makes the service importable as:
+    const { AirplaneService } = require('../services');
+    AirplaneService.createAirplane(data);
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/middlewares/airplane-middleware.js
+PURPOSE: Validates incoming request bodies BEFORE they reach the controller.
+         Acts as a gatekeeper — rejects bad data with clear error messages.
+────────────────────────────────────────────────────────────────────────────────
+
+WHAT IS MIDDLEWARE?
+  In Express, middleware is a function with signature: (req, res, next)
+  It sits BETWEEN the route match and the controller.
+  It can:
+  1. Inspect/modify the request (req)
+  2. Send a response (res) and STOP the chain
+  3. Call next() to pass control to the next function
+
+  Route definition: router.post('/', validateCreateRequest, createAirplane)
+  → Express runs validateCreateRequest FIRST. If it calls next(), createAirplane runs.
+    If it sends a response (res.status(400).json(...)), createAirplane NEVER runs.
+
+LINE: const { StatusCodes } = require('http-status-codes');
+  → Imports named HTTP status codes. StatusCodes.BAD_REQUEST = 400.
+    Using names instead of numbers makes code more readable and less error-prone.
+
+LINE: const { Logger } = require('../config');
+  → Imports the Winston logger for logging validation results.
+
+FUNCTION: validateCreateRequest(req, res, next)
+  → Validates the body for POST /api/v1/airplanes (creating a new airplane).
+
+  CHECK 1: if (!req.body.modelNumber)
+    → The ! (NOT) operator. Truthy/falsy check.
+      Returns true (fails validation) if modelNumber is:
+      - undefined  (field not sent)
+      - null
+      - ""         (empty string)
+      - 0          (zero — but model numbers shouldn't be 0)
+      
+      If it fails:
+      - Logger.warn() → logs the bad request (warning level, not error)
+      - Returns 400 Bad Request with explanation
+      - Does NOT call next() → controller never runs
+      - return statement ensures no further code in this function runs
+
+  CHECK 2: if (!req.body.capacity || !Number.isInteger(req.body.capacity) || req.body.capacity <= 0)
+    → Three conditions, ANY one failing rejects the request:
+      
+      !req.body.capacity
+        → capacity is missing, null, 0, or undefined
+      
+      !Number.isInteger(req.body.capacity)
+        → capacity exists but is not an integer.
+          Number.isInteger(180)   → true  ✓
+          Number.isInteger(180.5) → false ✗ (decimal)
+          Number.isInteger("180") → false ✗ (string — JSON would parse as int though)
+      
+      req.body.capacity <= 0
+        → capacity is zero or negative. An airplane with 0 seats makes no sense.
+      
+      Why || (OR)?
+        If ANY check is true, the whole condition is true → validation fails.
+        || short-circuits: if the first check is true, it doesn't evaluate the rest.
+
+  LINE: next();
+    → All checks passed. Tells Express to run the next function in the chain
+      (which is the controller). Without calling next(), the request would
+      hang forever — the client would never get a response.
+
+FUNCTION: validateUpdateRequest(req, res, next)
+  → Validates the body for PATCH /api/v1/airplanes/:id (updating an airplane).
+  
+  DIFFERENCE FROM CREATE:
+  For updates, not ALL fields are required. You might want to update just
+  the capacity without changing the modelNumber. So:
+  
+  CHECK 1: if (!req.body.modelNumber && !req.body.capacity)
+    → BOTH are missing. There's nothing to update. That's an error.
+      Using && (AND): BOTH must be falsy for this to fail.
+      If at least one is present, this check passes.
+  
+  CHECK 2: if (req.body.capacity !== undefined && (invalid check))
+    → Only validates capacity IF it was provided.
+      req.body.capacity !== undefined: guards against validating absent fields.
+      If you only sent { modelNumber: "B737" } with no capacity, 
+      this check is skipped entirely.
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/middlewares/index.js
+PURPOSE: Barrel export for middlewares.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: const AirplaneMiddleware = require('./airplane-middleware');
+LINE: module.exports = { AirplaneMiddleware };
+  → Routes import this as: const { AirplaneMiddleware } = require('../../middlewares');
+    Then use: AirplaneMiddleware.validateCreateRequest
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/controllers/airplane-controller.js
+PURPOSE: HTTP request/response handler for all airplane endpoints.
+         Extracts data from requests, calls service, sends responses.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: const { StatusCodes } = require("http-status-codes");
+  → Named HTTP status codes:
+    StatusCodes.CREATED = 201
+    StatusCodes.OK = 200
+    StatusCodes.NOT_FOUND = 404
+    StatusCodes.BAD_REQUEST = 400
+    StatusCodes.INTERNAL_SERVER_ERROR = 500
+
+LINE: const { AirplaneService } = require("../services");
+  → Imports the service layer (which contains: createAirplane, getAirplanes, etc.)
+
+LINE: const { Logger } = require("../config");
+  → Imports the Winston logger.
+
+FUNCTION: async function createAirplane(req, res) { ... }
+  → Handles: POST /api/v1/airplanes
+  
+  req.body contains the parsed JSON body (parsed by express.json() middleware).
+  Example: { modelNumber: "A320", capacity: 180 }
+  
+  FLOW:
+  1. Logger.info('...request received', { body: req.body })
+     → Logs what data came in. The second argument is METADATA — Winston
+       embeds it in the JSON log output as searchable fields.
+  
+  2. AirplaneService.createAirplane({ modelNumber: ..., capacity: ... })
+     → Explicitly extracts only the fields we need from req.body.
+       WHY NOT PASS req.body DIRECTLY?
+       Security: If a client sends { modelNumber: "A320", capacity: 180, id: 999 },
+       passing req.body directly would let them set the id. By extracting only
+       modelNumber and capacity, we ignore unexpected fields.
+  
+  3. On success → res.status(201).json({ success: true, data: airplane })
+     → Status 201 CREATED means "a new resource was successfully created."
+       The response body includes the created airplane with its auto-generated id.
+  
+  4. On error → res.status(500).json({ success: false, error: error.message })
+     → Status 500 INTERNAL SERVER ERROR means "something went wrong on our end."
+       We return the error message but NOT the stack trace (security — don't
+       expose internal details to clients).
+
+FUNCTION: async function getAirplanes(req, res) { ... }
+  → Handles: GET /api/v1/airplanes
+  
+  No input needed — fetches all airplanes.
+  Logs the COUNT of airplanes returned: { count: airplanes.length }
+  Returns 200 OK with the array.
+
+FUNCTION: async function getAirplane(req, res) { ... }
+  → Handles: GET /api/v1/airplanes/:id
+  
+  req.params.id contains the URL parameter.
+  Example: GET /api/v1/airplanes/5 → req.params.id = "5" (a STRING)
+  
+  NOTE: req.params.id is always a STRING, even if the URL says /5.
+  Sequelize's findByPk() can handle string "5" — it auto-converts.
+  
+  IF airplane is null (not found):
+    Logger.warn() → uses WARN level (not error — the app isn't broken,
+    the client just asked for something that doesn't exist)
+    Returns 404 NOT FOUND
+  
+  IF airplane exists:
+    Returns 200 OK with the airplane data.
+
+FUNCTION: async function updateAirplane(req, res) { ... }
+  → Handles: PATCH /api/v1/airplanes/:id
+  
+  req.params.id = the ID from URL
+  req.body = the fields to update
+  
+  WHY PATCH (not PUT)?
+    PUT means "replace the entire resource with this new data."
+    PATCH means "update only the specified fields."
+    Since we allow partial updates (just capacity, or just modelNumber),
+    PATCH is the correct HTTP method.
+  
+  Sequelize's update() returns [affectedCount]:
+    [1] → one row was updated (success)
+    [0] → no row with that ID exists
+  
+  response[0] === 0 check → returns 404 if no row was updated.
+
+FUNCTION: async function destroyAirplane(req, res) { ... }
+  → Handles: DELETE /api/v1/airplanes/:id
+  
+  Sequelize's destroy() returns the count of deleted rows:
+    1 → row was deleted
+    0 → no row with that ID
+  
+  response === 0 check → returns 404 if nothing was deleted.
+  
+  NOTE: This is a HARD DELETE — the row is permanently removed from the
+  database. In production systems, you might prefer SOFT DELETE (setting a
+  "deletedAt" timestamp instead, so data can be recovered). Sequelize supports
+  soft delete with the "paranoid: true" model option.
+
+LINE: module.exports = { createAirplane, getAirplanes, getAirplane, updateAirplane, destroyAirplane };
+  → Exports all 5 controller functions for the routes to use.
+
+RESPONSE FORMAT — All endpoints return this consistent structure:
+  {
+    "success": true/false,     ← Quick boolean check for the client
+    "message": "...",          ← Human-readable description of what happened
+    "data": { ... } or [],     ← The actual data (airplane object, array, etc.)
+    "error": {} or "..."       ← Error details (empty object on success)
+  }
+  
+  WHY CONSISTENT FORMAT?
+  The frontend can always expect the same structure. No guessing whether
+  the response has "result", "data", "payload", etc. Every response has
+  success + message + data + error.
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/controllers/info-controller.js
+PURPOSE: A simple health-check endpoint to verify the API is running.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: const info = (req, res) => { ... }
+  → Arrow function (equivalent to: function info(req, res) { ... })
+    Returns a simple JSON response confirming the API is alive.
+    
+    Usage: GET /api/v1/info
+    Response: { success: true, message: "api is working", error: {}, data: {} }
+    
+    Health check endpoints are used by:
+    - Load balancers (to know if the server is up)
+    - Docker health checks
+    - Monitoring tools
+    - Developers testing connectivity
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/controllers/index.js
+PURPOSE: Barrel export for controllers.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: module.exports = {
+        Infocontroller: require('./info-controller'),
+        Airplanecontroller: require('./airplane-controller')
+      }
+  → Routes import this as:
+    const { Airplanecontroller } = require('../../controllers');
+    Airplanecontroller.createAirplane  → the function
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/routes/index.js
+PURPOSE: The ROOT router. All routes start here.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: const express = require("express");
+LINE: const v1routes = require('./v1');
+LINE: const router = express.Router();
+  → Creates an Express Router — a mini-application that can have its own routes.
+    Routers can be mounted on other routers or on the app, creating a tree.
+
+LINE: router.use('/v1', v1routes);
+  → Mounts all v1 routes under the "/v1" prefix.
+    Combined with app.use('/api', ...) in index.js:
+    Full URL: /api/v1/...
+    
+    WHY VERSION PREFIXES (/v1)?
+    API versioning. When you change the API in a breaking way, you create /v2.
+    Old clients still use /v1 (which keeps working). New clients use /v2.
+    This prevents breaking existing integrations.
+
+LINE: module.exports = router;
+  → Exported to src/index.js which mounts it on /api.
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/routes/v1/index.js
+PURPOSE: Groups all v1 route modules together.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: router.use('/airplanes', airplaneRoutes);
+  → All airplane routes live under /airplanes.
+    Full URL: /api/v1/airplanes/...
+
+LINE: router.get('/info', Infocontroller.info);
+  → The health-check endpoint.
+    Full URL: GET /api/v1/info
+
+    HOW URL BUILDING WORKS (route nesting):
+    app.use('/api', mainRouter)           → strips /api
+      mainRouter.use('/v1', v1Router)     → strips /v1
+        v1Router.use('/airplanes', airplaneRouter)  → strips /airplanes
+          airplaneRouter.post('/', ...)   → matches /
+    
+    Full URL: POST /api/v1/airplanes/
+    Each router strips its prefix and passes the remainder to the next.
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/routes/v1/airplane-routes.js
+PURPOSE: Defines all HTTP endpoints for airplane operations.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: const { Airplanecontroller } = require('../../controllers');
+LINE: const { AirplaneMiddleware } = require('../../middlewares');
+  → Imports controller functions and middleware validators.
+
+LINE: router.get('/', Airplanecontroller.getAirplanes);
+  → GET /api/v1/airplanes → returns all airplanes.
+    No middleware needed — no body to validate for GET requests.
+
+LINE: router.post('/', AirplaneMiddleware.validateCreateRequest, Airplanecontroller.createAirplane);
+  → POST /api/v1/airplanes → creates a new airplane.
+    TWO functions in order:
+    1. validateCreateRequest checks the body
+    2. IF validation passes (next() called), createAirplane runs
+    
+    This is the EXPRESS MIDDLEWARE CHAIN:
+    router.post('/', fn1, fn2, fn3, ...)
+    Express runs fn1. If fn1 calls next(), it runs fn2. If fn2 calls next(), fn3. Etc.
+    If any function sends a response WITHOUT calling next(), the chain stops.
+
+LINE: router.get('/:id', Airplanecontroller.getAirplane);
+  → GET /api/v1/airplanes/5 → get airplane with id=5.
+    :id is a ROUTE PARAMETER. Express extracts the value and puts it in req.params.id.
+    The colon (:) tells Express "this part of the URL is variable."
+
+LINE: router.patch('/:id', AirplaneMiddleware.validateUpdateRequest, Airplanecontroller.updateAirplane);
+  → PATCH /api/v1/airplanes/5 → update airplane with id=5.
+    Middleware validates the body first (at least one field, valid capacity if provided).
+
+LINE: router.delete('/:id', Airplanecontroller.destroyAirplane);
+  → DELETE /api/v1/airplanes/5 → delete airplane with id=5.
+    No middleware needed — DELETE has no body to validate.
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/utils/errors/app-error.js
+PURPOSE: Custom error class for application-specific errors with HTTP status codes.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: class AppError extends Error { ... }
+  → Extends JavaScript's built-in Error class.
+    Regular Error only has "message" and "stack" (stack trace).
+    AppError adds:
+    - statusCode: The HTTP status code to return (400, 404, 500, etc.)
+    - explanation: A user-friendly description of what went wrong.
+
+LINE: constructor(message, statusCode) { super(message); ... }
+  → super(message) calls Error's constructor, which sets:
+    - this.message = message
+    - this.stack = (auto-generated stack trace)
+    Then we add our custom properties:
+    - this.statusCode = statusCode
+    - this.explanation = message (same as message, for explicitness)
+
+  USAGE (not yet implemented, planned for Phase 5):
+    throw new AppError('Airplane not found', 404);
+    
+    Then a global error handler middleware catches it:
+    app.use((err, req, res, next) => {
+      if (err instanceof AppError) {
+        res.status(err.statusCode).json({ message: err.explanation });
+      }
+    });
+
+  CURRENTLY: This class exists but is NOT used anywhere yet.
+  It will be integrated in Phase 5 (Error Handling).
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE: src/utils/index.js
+PURPOSE: Barrel export for utilities. Currently empty.
+────────────────────────────────────────────────────────────────────────────────
+
+Will be populated as utilities are created (e.g., AppError export,
+helper functions, validators, etc.)
+
+
+================================================================================
+5. PHASE 1 CHANGELOG — What bugs were fixed, what was added
+================================================================================
+
+PHASE 1 OBJECTIVE: Fix existing bugs + complete Airplane CRUD operations.
+
+BUG FIX 1: crud-repository.js — Broken Logger import
+  BEFORE: const {Logger} = require('../config');
+  AFTER:  (removed)
+  WHY:    config/index.js only exported serverConfig, not Logger.
+          Logger was undefined. If used, it would crash with "Cannot read
+          property 'info' of undefined". Removed because Logger didn't
+          exist yet (added back in Phase 2 after configuring Winston).
+
+BUG FIX 2: crud-repository.js — Unused "where" import
+  BEFORE: const { where } = require("sequelize");
+  AFTER:  (removed)
+  WHY:    Imported but never used. Dead code that clutters the file.
+
+BUG FIX 3: crud-repository.js — get() ignores its parameter
+  BEFORE: const response = this.model.findByPk();
+  AFTER:  const response = await this.model.findByPk(data);
+  WHY:    findByPk() with no argument returns null always. The "data"
+          parameter (containing the ID) was completely ignored. Fixed by
+          passing data to findByPk(data).
+
+BUG FIX 4: crud-repository.js — Missing "await" on destroy()
+  BEFORE: const response = this.model.destroy(...)
+  AFTER:  const response = await this.model.destroy(...)
+  WHY:    Without await, the function returns a Promise object instead of
+          the actual result. The caller would get Promise {} instead of 1
+          (the count of deleted rows). The delete might not finish before
+          the response is sent.
+
+BUG FIX 5: crud-repository.js — Missing "await" on update()
+  BEFORE: const response = this.model.update(...)
+  AFTER:  const response = await this.model.update(...)
+  WHY:    Same issue as destroy(). Without await, the caller gets an
+          unresolved Promise instead of [affectedCount].
+
+BUG FIX 6: crud-repository.js — Method name "getALL" 
+  BEFORE: async getALL(data)
+  AFTER:  async getAll()
+  WHY:    JavaScript convention is camelCase. "getALL" is inconsistent.
+          Also removed the unused "data" parameter (getAll takes no args).
+
+NEW: airplane-middleware.js — Request body validation
+  ADDED: validateCreateRequest(req, res, next)
+         validateUpdateRequest(req, res, next)
+  WHY:   Without validation, bad data reaches the database. If someone
+         sends { capacity: -5 }, Sequelize might insert it (INTEGER accepts
+         negative). Middleware catches this early and returns a clear 400 error.
+
+NEW: Airplane service methods — getAirplanes, getAirplane, updateAirplane, destroyAirplane
+  WHY:   Only createAirplane existed. Added the remaining CRUD operations
+         to complete the full lifecycle.
+
+NEW: Airplane controller methods — getAirplanes, getAirplane, updateAirplane, destroyAirplane
+  WHY:   Only createAirplane existed. Added HTTP handlers for GET, PATCH, DELETE.
+         Each handles success (200/201), not-found (404), and error (500) cases.
+
+NEW: Airplane routes — GET /, GET /:id, PATCH /:id, DELETE /:id
+  BEFORE: Only POST / existed.
+  WHY:    Needed routes for all CRUD operations to make them accessible via HTTP.
+
+CLEANUP: Removed console.log() statements from:
+  - src/index.js ("starting from server1", "starting from server2")
+  - src/routes/index.js ("starting from v1 routes")
+  - src/routes/v1/airplane-routes.js ("starting from airplane routes")
+  - src/controllers/airplane-controller.js ("inside controller", "inside error")
+  WHY:   These were developer debugging logs. They pollute the output and
+         provide no useful information in production. Replaced with proper
+         Winston logging in Phase 2.
+
+
+================================================================================
+6. PHASE 2 CHANGELOG — How logging was added
+================================================================================
+
+PHASE 2 OBJECTIVE: Replace all console.log with structured Winston logging.
+
+CREATED: src/config/logger-config.js
+  → Full Winston logger configuration with:
+    - 3 transports: console (dev), combined.log, error.log
+    - JSON format with timestamps for file output
+    - Colorized simple format for console output
+    - Conditional console transport (dev only)
+
+UPDATED: src/config/index.js
+  → Added Logger export to barrel.
+
+UPDATED: src/repositories/crud-repository.js
+  → Added Logger.info() on success and Logger.error() on failure
+    in all 5 CRUD methods.
+
+UPDATED: src/services/airplaneService.js
+  → Added try/catch blocks with Logger.info() and Logger.error()
+    in all 5 service methods. Logs include metadata (data, id).
+
+UPDATED: src/controllers/airplane-controller.js
+  → Added Logger.info() for request received and success.
+    Added Logger.warn() for not-found cases (404).
+    Added Logger.error() for failures (500).
+
+UPDATED: src/middlewares/airplane-middleware.js
+  → Added Logger.warn() for validation failures.
+    Added Logger.info() for validation passed.
+
+UPDATED: src/index.js
+  → Replaced console.log("started server") with
+    Logger.info(`Server started successfully on port ${serverConfig.PORT}`);
+
+LOG LEVELS USED AND WHY:
+  Logger.info(...)  → Normal operation. "Request received", "created successfully"
+  Logger.warn(...)  → Unusual but not broken. "Airplane not found" (404),
+                      "validation failed" (400). The app is working fine,
+                      the client made a bad request.
+  Logger.error(...) → Something is broken. Database connection failed,
+                      unexpected exception. Needs investigation.
+
+TRACE PATTERN — The layered logging creates a full request trace:
+  Each layer prefixes its logs with its name, so you can filter:
+  - "Middleware: ..." → validation layer
+  - "Controller: ..." → HTTP handler layer  
+  - "Airplane service: ..." → business logic layer
+  - "Successfully created/fetched/..." → repository (database) layer
+
+
+================================================================================
+7. API REFERENCE — Every endpoint available
+================================================================================
+
+BASE URL: http://localhost:{PORT}/api/v1
+
+ENDPOINT 1: GET /api/v1/info
+  Purpose:  Health check — verify the API is running
+  Body:     None
+  Response: 200 OK
+  {
+    "success": true,
+    "message": "api is working",
+    "error": {},
+    "data": {}
+  }
+
+ENDPOINT 2: GET /api/v1/airplanes
+  Purpose:  Get all airplanes in the database
+  Body:     None
+  Response: 200 OK
+  {
+    "success": true,
+    "message": "Successfully fetched all airplanes",
+    "data": [
+      { "id": 1, "modelNumber": "A320", "capacity": 180, "createdAt": "...", "updatedAt": "..." },
+      { "id": 2, "modelNumber": "B737", "capacity": 200, "createdAt": "...", "updatedAt": "..." }
+    ],
+    "error": {}
+  }
+
+ENDPOINT 3: POST /api/v1/airplanes
+  Purpose:  Create a new airplane
+  Body:     { "modelNumber": "A320", "capacity": 180 }
+  Headers:  Content-Type: application/json
+  Middleware: validateCreateRequest (checks modelNumber and capacity)
+  Response: 201 Created
+  {
+    "success": true,
+    "message": "Successfully created an airplane",
+    "data": { "id": 3, "modelNumber": "A320", "capacity": 180, "createdAt": "...", "updatedAt": "..." },
+    "error": {}
+  }
+  Error (400): { "success": false, "message": "modelNumber is required and cannot be empty" }
+
+ENDPOINT 4: GET /api/v1/airplanes/:id
+  Purpose:  Get a single airplane by ID
+  Body:     None
+  Response: 200 OK → airplane object
+  Error:    404 Not Found → { "success": false, "message": "Airplane not found for the given ID" }
+
+ENDPOINT 5: PATCH /api/v1/airplanes/:id
+  Purpose:  Update an airplane's fields
+  Body:     { "capacity": 200 } (partial update allowed)
+  Middleware: validateUpdateRequest
+  Response: 200 OK → [1] (affected count)
+  Error:    404 Not Found (if ID doesn't exist)
+  Error:    400 Bad Request (if no fields provided or invalid capacity)
+
+ENDPOINT 6: DELETE /api/v1/airplanes/:id
+  Purpose:  Delete an airplane
+  Body:     None
+  Response: 200 OK → 1 (deleted count)
+  Error:    404 Not Found (if ID doesn't exist)
+
+
+================================================================================
+8. ERROR HANDLING FLOW — How errors propagate through layers
+================================================================================
+
+Errors in this application follow a BUBBLE-UP pattern.
+Each layer catches the error, logs it, then re-throws it to the layer above.
+Only the CONTROLLER sends the HTTP response.
+
+EXAMPLE: Database connection is down. Client sends POST /api/v1/airplanes.
+
+STEP 1 — Repository layer:
+  try {
+    await this.model.create(data);           ← MySQL throws ECONNREFUSED
+  } catch (error) {
+    Logger.error('Error in create repo...')   ← Logged at REPO level
+    throw error;                              ← Re-thrown to service
+  }
+
+STEP 2 — Service layer:
+  try {
+    await airplaneRepository.create(data);    ← Catches the re-thrown error
+  } catch (error) {
+    Logger.error('Airplane service: create failed')  ← Logged at SERVICE level
+    throw error;                              ← Re-thrown to controller
+  }
+
+STEP 3 — Controller layer:
+  try {
+    await AirplaneService.createAirplane(data);  ← Catches the re-thrown error
+  } catch (error) {
+    Logger.error('Controller: create failed')     ← Logged at CONTROLLER level
+    return res.status(500).json({                 ← SENDS THE HTTP RESPONSE
+      success: false,
+      message: 'Failed to create an airplane',
+      error: error.message                        ← "connect ECONNREFUSED"
+    });
+  }
+
+FULL LOG OUTPUT (all three layers logged):
+  error: Error in create repository layer {"error":"connect ECONNREFUSED 127.0.0.1:3306"}
+  error: Airplane service: createAirplane failed {"error":"connect ECONNREFUSED 127.0.0.1:3306"}
+  error: Controller: createAirplane failed {"error":"connect ECONNREFUSED 127.0.0.1:3306"}
+
+LOGS GO TO:
+  Console → All three lines (red, because error level)
+  logs/combined.log → All three lines (JSON format with timestamps)
+  logs/error.log → All three lines (because level is 'error')
+
+CLIENT RECEIVES:
+  HTTP/1.1 500 Internal Server Error
+  { "success": false, "message": "Failed to create...", "error": "connect ECONNREFUSED..." }
+
+WHY LOG AT EVERY LAYER?
+  Because each layer adds CONTEXT. The repo log says "database failed."
+  The service log says "createAirplane failed." The controller log says
+  "the POST /airplanes endpoint failed." Together they form a complete
+  trace: which endpoint → which operation → which database call failed.
+  In a large system with many models and operations, this trace is invaluable.
+
+
+================================================================================
+9. PHASE 3 — CITY & AIRPORT MODELS (Complete Documentation)
+================================================================================
+
+PHASE 3 OBJECTIVE: Add City and Airport models with a parent-child relationship
+(City hasMany Airports, Airport belongsTo City), full CRUD for both, with
+CASCADE deletes ensuring data integrity.
+
+
+────────────────────────────────────────────────────────────────────────────────
+CONCEPT: DATABASE RELATIONSHIPS (Foreign Keys)
+────────────────────────────────────────────────────────────────────────────────
+
+A FOREIGN KEY is a column in one table that references the PRIMARY KEY of
+another table. It creates a LINK between two tables.
+
+In our system:
+  - The Cities table has an "id" column (primary key)
+  - The Airports table has a "cityId" column (foreign key → Cities.id)
+
+This means:
+  1. Every airport MUST belong to a city (cityId cannot be null)
+  2. You CANNOT insert an airport with a cityId that doesn't exist in Cities
+     → MySQL rejects it with: ER_NO_REFERENCED_ROW
+  3. If you delete a city, all its airports are automatically deleted (CASCADE)
+
+WHY NOT JUST STORE THE CITY NAME ON THE AIRPORT?
+  If you did: Airports = { name: "BOM", cityName: "Mumbai" }
+  Problems:
+  - If "Mumbai" is renamed to "Mumbai City", you must update EVERY airport row
+  - No validation — you could typo "Mumba" and it would be accepted
+  - You can't easily list "all airports in Mumbai" without string matching
+  
+  With a foreign key: Airports = { name: "BOM", cityId: 1 }
+  Benefits:
+  - Change city name in one place (Cities table), all airports reflect it
+  - MySQL enforces that cityId must reference a real city
+  - Query is simple: WHERE cityId = 1
+
+CASCADE DELETE:
+  When you delete a city, what should happen to its airports?
+  Options:
+  - RESTRICT: Prevent deletion if airports exist (error)
+  - SET NULL: Set cityId to null on orphaned airports
+  - CASCADE: Delete all airports that belonged to that city
+  
+  We chose CASCADE: Deleting "Mumbai" also deletes "BOM" and "JUH" airports.
+  This makes sense because an airport cannot exist without a city.
+
+
+────────────────────────────────────────────────────────────────────────────────
+CONCEPT: SEQUELIZE ASSOCIATIONS (hasMany / belongsTo)
+────────────────────────────────────────────────────────────────────────────────
+
+Sequelize needs to know about relationships from BOTH sides:
+
+  City.hasMany(Airport, { foreignKey: 'cityId', onDelete: 'CASCADE' })
+    → "One City has many Airports. The link is via cityId column on Airport."
+    → Enables: City.findAll({ include: Airport })
+    → SQL: SELECT * FROM Cities LEFT JOIN Airports ON Cities.id = Airports.cityId
+
+  Airport.belongsTo(City, { foreignKey: 'cityId', onDelete: 'CASCADE' })
+    → "One Airport belongs to one City. My cityId column points to City."
+    → Enables: Airport.findAll({ include: City })
+    → SQL: SELECT * FROM Airports LEFT JOIN Cities ON Airports.cityId = Cities.id
+
+WHERE ARE THESE DEFINED?
+  In each model's static associate() method:
+  
+  // In src/models/city.js
+  static associate(models) {
+    this.hasMany(models.Airport, { foreignKey: 'cityId', onDelete: 'CASCADE' });
+  }
+  
+  // In src/models/airport.js
+  static associate(models) {
+    this.belongsTo(models.City, { foreignKey: 'cityId', onDelete: 'CASCADE' });
+  }
+
+WHEN ARE THEY CALLED?
+  In src/models/index.js, after all models are loaded:
+  
+  Object.keys(db).forEach(modelName => {
+    if (db[modelName].associate) {
+      db[modelName].associate(db);
+    }
+  });
+  
+  This loop calls City.associate(db) and Airport.associate(db),
+  passing the db object (which contains ALL loaded models).
+  Inside associate(), "models.Airport" resolves to the Airport class.
+
+INCLUDE (Eager Loading):
+  When fetching airports, we want the city data embedded:
+  
+  Airport.findAll({ include: [{ model: City, attributes: ['id', 'name'] }] })
+  
+  Generates SQL:
+    SELECT Airports.*, Cities.id, Cities.name
+    FROM Airports
+    LEFT OUTER JOIN Cities ON Airports.cityId = Cities.id;
+  
+  Returns:
+  [
+    {
+      id: 1, name: "CSMI Airport", code: "BOM", cityId: 1,
+      City: { id: 1, name: "Mumbai" }    ← embedded city data!
+    }
+  ]
+  
+  "attributes: ['id', 'name']" limits which City columns are included.
+  Without it, you'd also get createdAt, updatedAt for the City — unnecessary noise.
+
+
+────────────────────────────────────────────────────────────────────────────────
+NEW FILE: src/migrations/20260402100000-create-city.js
+PURPOSE: Creates the Cities table in the database.
+────────────────────────────────────────────────────────────────────────────────
+
+MIGRATION ORDERING:
+  Filename: 20260402100000-create-city.js
+  The Airport migration is: 20260402100001-create-airport.js
+  
+  Sequelize runs migrations in ALPHABETICAL ORDER (by timestamp).
+  The City migration runs FIRST because 100000 < 100001.
+  This is critical: the Airport migration references Cities.id as a
+  foreign key. If Cities doesn't exist yet, the migration fails.
+
+COLUMNS:
+  id:        Auto-incrementing primary key (same as Airplane)
+  name:      STRING, NOT NULL, UNIQUE
+             UNIQUE constraint means MySQL creates an INDEX on this column.
+             INSERT INTO Cities (name) VALUES ('Mumbai') → succeeds
+             INSERT INTO Cities (name) VALUES ('Mumbai') → FAILS (duplicate)
+             SQL error: ER_DUP_ENTRY: Duplicate entry 'Mumbai' for key 'name'
+  createdAt: Auto-managed by Sequelize
+  updatedAt: Auto-managed by Sequelize
+
+SQL GENERATED:
+  CREATE TABLE `Cities` (
+    `id` INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    `name` VARCHAR(255) NOT NULL UNIQUE,
+    `createdAt` DATETIME NOT NULL,
+    `updatedAt` DATETIME NOT NULL
+  );
+
+DOWN (UNDO):
+  DROP TABLE `Cities`;
+  WARNING: Also drops all data. And because of CASCADE, any airports
+  referencing these cities would also be deleted.
+
+
+────────────────────────────────────────────────────────────────────────────────
+NEW FILE: src/migrations/20260402100001-create-airport.js
+PURPOSE: Creates the Airports table with a foreign key to Cities.
+────────────────────────────────────────────────────────────────────────────────
+
+COLUMNS:
+  id:        Auto-incrementing primary key
+  name:      STRING, NOT NULL — the full airport name (e.g., "Indira Gandhi International")
+  code:      STRING, NOT NULL, UNIQUE — the IATA code (e.g., "DEL", "BOM", "JFK")
+             Unique because no two airports can share the same IATA code globally.
+  address:   STRING, ALLOW NULL — optional physical address
+             allowNull: true means this column can be left empty.
+  cityId:    INTEGER, NOT NULL, FOREIGN KEY → Cities.id
+             This is the RELATIONSHIP column. Let's break it down:
+             
+             type: Sequelize.INTEGER  → matches Cities.id type (also INTEGER)
+             allowNull: false         → every airport MUST have a city
+             references: {
+               model: 'Cities',       → the TABLE this FK points to
+               key: 'id'              → the COLUMN in that table
+             }
+             onDelete: 'CASCADE'      → if the referenced City is deleted,
+                                        this airport row is also deleted
+
+SQL GENERATED:
+  CREATE TABLE `Airports` (
+    `id` INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    `name` VARCHAR(255) NOT NULL,
+    `code` VARCHAR(255) NOT NULL UNIQUE,
+    `address` VARCHAR(255),
+    `cityId` INTEGER NOT NULL REFERENCES `Cities` (`id`) ON DELETE CASCADE,
+    `createdAt` DATETIME NOT NULL,
+    `updatedAt` DATETIME NOT NULL
+  );
+
+DOWN (UNDO):
+  DROP TABLE `Airports`;
+
+
+────────────────────────────────────────────────────────────────────────────────
+NEW FILE: src/models/city.js
+PURPOSE: Sequelize model for the Cities table.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: module.exports = (sequelize, DataTypes) => { ... }
+  → Factory function (same pattern as airplane.js).
+    Called by models/index.js auto-discovery with the DB connection and types.
+
+LINE: class City extends Model { ... }
+  → City class — each instance represents one row in Cities table.
+
+LINE: static associate(models) { this.hasMany(models.Airport, { foreignKey: 'cityId', onDelete: 'CASCADE' }); }
+  → Declares: "One City can have MANY Airports."
+  
+  What this enables:
+  1. City.findAll({ include: models.Airport })
+     → Returns cities WITH their airports nested as an array
+     → [{ id: 1, name: "Mumbai", Airports: [{ code: "BOM" }, { code: "JUH" }] }]
+  
+  2. Sequelize knows to use cityId as the linking column
+  
+  3. onDelete: 'CASCADE' means: when a City is destroyed via Sequelize,
+     it cascades to delete related Airports (in addition to the DB-level cascade)
+
+LINE: City.init({ name: { type: DataTypes.STRING, allowNull: false, unique: true } }, { ... })
+  → Defines the model schema. The constraints here (allowNull, unique)
+    are enforced BOTH at the model level (Sequelize validates before querying)
+    AND at the database level (MySQL enforces on INSERT/UPDATE).
+    
+    Double enforcement is good: Sequelize catches errors early with nice
+    JavaScript error messages, and MySQL catches anything that slips through.
+
+
+────────────────────────────────────────────────────────────────────────────────
+NEW FILE: src/models/airport.js
+PURPOSE: Sequelize model for the Airports table.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: static associate(models) { this.belongsTo(models.City, { foreignKey: 'cityId', onDelete: 'CASCADE' }); }
+  → Declares: "One Airport belongs to ONE City."
+    This is the INVERSE of City.hasMany(Airport).
+    
+    belongsTo means: "I have a foreign key column (cityId) that points to City."
+    hasMany means: "Another table has a foreign key that points to me."
+    
+    You need BOTH declarations for full association functionality:
+    - City.hasMany → enables City.findAll({ include: Airport })
+    - Airport.belongsTo → enables Airport.findAll({ include: City })
+
+LINE: Airport.init({ name: ..., code: ..., address: ..., cityId: ... }, { ... })
+  → Defines 4 columns:
+    
+    name: { type: DataTypes.STRING, allowNull: false }
+      → Airport name. Required.
+    
+    code: { type: DataTypes.STRING, allowNull: false, unique: true }
+      → IATA code. Required and unique.
+      → Sequelize validates uniqueness BEFORE sending to DB (pre-validation)
+      → MySQL also enforces via UNIQUE index (database-level safety net)
+    
+    address: { type: DataTypes.STRING, allowNull: true }
+      → Optional. allowNull: true is actually the default in Sequelize,
+        but we set it explicitly for clarity.
+    
+    cityId: { type: DataTypes.INTEGER, allowNull: false }
+      → The foreign key column. Just declared as INTEGER here — the
+        FOREIGN KEY constraint is defined in the migration file, not the model.
+        Sequelize's association methods (belongsTo/hasMany) handle the
+        relationship logic in JavaScript; the migration handles it in SQL.
+
+
+────────────────────────────────────────────────────────────────────────────────
+NEW FILE: src/repositories/city-repository.js
+PURPOSE: Repository for City database operations.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: class CityRepository extends CrudRepository { constructor() { super(City); } }
+  → Same pattern as AirplaneRepository.
+    Inherits all 5 CRUD methods from CrudRepository.
+    super(City) sets this.model = City.
+    
+    No method overrides needed — City doesn't have relationships that
+    need eager loading in basic CRUD operations. If you later want
+    getCityWithAirports(), you'd add a custom method here.
+
+
+────────────────────────────────────────────────────────────────────────────────
+NEW FILE: src/repositories/airport-repository.js
+PURPOSE: Repository for Airport database operations. OVERRIDES getAll() and
+         get() to include associated City data.
+────────────────────────────────────────────────────────────────────────────────
+
+LINE: const { Airport, City } = require('../models');
+  → Imports BOTH models — Airport for CRUD, City for the include (JOIN).
+
+LINE: class AirportRepository extends CrudRepository { constructor() { super(Airport); } }
+  → Inherits create(), update(), destroy() from CrudRepository (no override needed).
+    But OVERRIDES getAll() and get() — see below.
+
+METHOD OVERRIDE: async getAll()
+  → OVERRIDES CrudRepository.getAll() completely.
+    Instead of just Airport.findAll(), it does:
+    
+    Airport.findAll({
+      include: [{
+        model: City,
+        attributes: ['id', 'name']
+      }]
+    })
+    
+    WHY OVERRIDE INSTEAD OF MODIFY CRUDREPOSITORY?
+    CrudRepository is a GENERIC base class used by ALL models.
+    Most models don't need include. Adding include to CrudRepository would
+    break Airplane's getAll() (Airplane has no associations yet).
+    So we override ONLY in AirportRepository.
+    
+    HOW METHOD OVERRIDE WORKS IN JAVASCRIPT:
+    When you call airportRepository.getAll():
+    1. JS looks for getAll() on AirportRepository → FOUND (we defined it)
+    2. Runs OUR version (with include), NOT the parent's version
+    3. If we hadn't defined it, JS would climb to CrudRepository → use that version
+    
+    This is POLYMORPHISM — same method name, different behavior depending
+    on which class you're using.
+
+  SQL GENERATED (with include):
+    SELECT `Airport`.`id`, `Airport`.`name`, `Airport`.`code`, `Airport`.`address`,
+           `Airport`.`cityId`, `Airport`.`createdAt`, `Airport`.`updatedAt`,
+           `City`.`id` AS `City.id`, `City`.`name` AS `City.name`
+    FROM `Airports` AS `Airport`
+    LEFT OUTER JOIN `Cities` AS `City` ON `Airport`.`cityId` = `City`.`id`;
+
+  RESPONSE FORMAT:
+    [
+      {
+        "id": 1,
+        "name": "Chhatrapati Shivaji Maharaj International",
+        "code": "BOM",
+        "address": "Mumbai Airport Road",
+        "cityId": 1,
+        "City": {                    ← Nested object from JOIN
+          "id": 1,
+          "name": "Mumbai"
+        }
+      }
+    ]
+
+METHOD OVERRIDE: async get(id)
+  → Same as getAll() but for a single airport.
+    Uses findByPk(id, { include: ... }) instead of findAll({ include: ... }).
+    
+  SQL GENERATED:
+    SELECT `Airport`.*, `City`.`id`, `City`.`name`
+    FROM `Airports` AS `Airport`
+    LEFT OUTER JOIN `Cities` AS `City` ON `Airport`.`cityId` = `City`.`id`
+    WHERE `Airport`.`id` = 1;
+
+METHODS NOT OVERRIDDEN (inherited from CrudRepository):
+  - create(data): Just inserts a row. No need for include on create.
+  - update(data, id): Just updates columns. No need for include on update.
+  - destroy(id): Just deletes a row. No need for include on delete.
+
+
+────────────────────────────────────────────────────────────────────────────────
+NEW FILE: src/services/cityService.js
+PURPOSE: Business logic layer for City operations.
+────────────────────────────────────────────────────────────────────────────────
+
+IDENTICAL PATTERN to airplaneService.js. Five functions:
+
+  createCity(data)       → cityRepository.create(data)
+  getCities()            → cityRepository.getAll()
+  getCity(id)            → cityRepository.get(id)
+  updateCity(id, data)   → cityRepository.update(data, id)  [note: params swapped]
+  destroyCity(id)        → cityRepository.destroy(id)
+
+Each has try/catch with Logger.info() on entry and Logger.error() on failure.
+The error is always re-thrown to the controller.
+
+PARAMETER SWAPPING in updateCity(id, data):
+  Service API: updateCity(id, data)    — id first (intuitive for the caller)
+  Repository API: update(data, id)     — data first (matches Sequelize convention)
+  The service translates between these conventions.
+
+
+================================================================================
+                        PHASE 4: FLIGHT MODEL & FILTERING
+================================================================================
+
+OVERVIEW:
+  Phase 4 introduces the Flight model — the most complex entity so far.
+  A Flight has THREE foreign keys and supports advanced filtering/sorting.
+  It also introduces a dedicated "update seats" endpoint for future Booking Service integration.
+
+NEW FILES CREATED:
+  1. src/migrations/20260402100002-create-flight.js  — DB migration
+  2. src/models/flight.js                            — Sequelize model
+  3. src/repositories/flight-repository.js           — Repository with filtering
+  4. src/services/flightService.js                   — Business logic
+  5. src/controllers/flight-controller.js            — HTTP handlers
+  6. src/middlewares/flight-middleware.js             — Request validation
+  7. src/routes/v1/flight-routes.js                  — Route definitions
+
+MODIFIED FILES:
+  8. src/models/airplane.js                          — Added hasMany(Flight)
+  9. src/models/airport.js                           — Added hasMany(Flight) x2
+  10. src/repositories/index.js                      — Added FlightRepository export
+  11. src/services/index.js                          — Added FlightService export
+  12. src/controllers/index.js                       — Added Flightcontroller export
+  13. src/middlewares/index.js                        — Added FlightMiddleware export
+  14. src/routes/v1/index.js                         — Mounted /flights routes
+
+
+─── MIGRATION: 20260402100002-create-flight.js ────────────────────────────────
+
+PURPOSE: Creates the 'Flights' table in the database.
+
+COLUMNS:
+  id                  INTEGER     PK, auto-increment
+  flightNumber        STRING      NOT NULL      — e.g., "AI-302"
+  airplaneId          INTEGER     NOT NULL, FK → Airplanes.id, CASCADE DELETE
+  departureAirportId  STRING      NOT NULL, FK → Airports.code, CASCADE DELETE
+  arrivalAirportId    STRING      NOT NULL, FK → Airports.code, CASCADE DELETE
+  departureTime       DATE        NOT NULL      — when the flight departs
+  arrivalTime         DATE        NOT NULL      — when the flight arrives
+  price               INTEGER     NOT NULL      — cost per seat
+  boardingGate        STRING      NULLABLE      — can be assigned later
+  totalSeats          INTEGER     NOT NULL      — total capacity for this flight
+  remainingSeats      INTEGER     NOT NULL      — seats still available
+  createdAt           DATE        NOT NULL      — Sequelize timestamp
+  updatedAt           DATE        NOT NULL      — Sequelize timestamp
+
+WHY AIRPORT CODE INSTEAD OF ID:
+  departureAirportId and arrivalAirportId are STRING type referencing Airports.code
+  (IATA codes like "DEL", "BOM", "JFK") instead of numeric Airports.id.
+  This makes API queries more intuitive:
+    GET /flights?departureAirportId=DEL   (clear)
+    GET /flights?departureAirportId=3     (opaque)
+
+CASCADE DELETE BEHAVIOR:
+  - If an Airplane is deleted → all its Flights are deleted
+  - If a departure Airport is deleted → all flights FROM that airport are deleted
+  - If an arrival Airport is deleted → all flights TO that airport are deleted
+  (This cascades further: City deleted → Airports deleted → Flights deleted)
+
+
+─── MODEL: src/models/flight.js ───────────────────────────────────────────────
+
+PURPOSE: Defines the Flight Sequelize model with 3 associations.
+
+ASSOCIATIONS (belongsTo):
+  1. belongsTo(Airplane, { foreignKey: 'airplaneId', onDelete: 'CASCADE' })
+     → A flight uses one airplane.
+
+  2. belongsTo(Airport, {
+       foreignKey: 'departureAirportId',
+       targetKey: 'code',            ← KEY: matches via Airport.code, not Airport.id
+       as: 'departureAirport',       ← ALIAS: required because two FKs point to same table
+       onDelete: 'CASCADE'
+     })
+     → A flight departs from one airport.
+
+  3. belongsTo(Airport, {
+       foreignKey: 'arrivalAirportId',
+       targetKey: 'code',
+       as: 'arrivalAirport',
+       onDelete: 'CASCADE'
+     })
+     → A flight arrives at one airport.
+
+WHY ALIASES ARE REQUIRED:
+  Without 'as: departureAirport' and 'as: arrivalAirport', Sequelize wouldn't
+  know which FK to use when eager-loading Airport data. The alias tells it:
+    include: { model: Airport, as: 'departureAirport' }  → uses departureAirportId
+    include: { model: Airport, as: 'arrivalAirport' }    → uses arrivalAirportId
+
+WHY targetKey: 'code':
+  Sequelize defaults to matching FKs against the target model's PRIMARY KEY (id).
+  But our FK stores airport CODES (strings like "DEL"), not airport IDs.
+  targetKey: 'code' tells Sequelize: "match this FK against Airport.code, not Airport.id".
+  Without it, eager loading returns NULL (id=DEL doesn't exist).
+
+
+─── MODEL UPDATES: airplane.js & airport.js ───────────────────────────────────
+
+AIRPLANE MODEL — ADDED ASSOCIATION:
+  BEFORE: static associate(models) { /* empty */ }
+  AFTER:  this.hasMany(models.Flight, { foreignKey: 'airplaneId', onDelete: 'CASCADE' })
+
+  This is the REVERSE of Flight.belongsTo(Airplane). It lets you do:
+    airplane.getFlights()  — get all flights for an airplane
+
+AIRPORT MODEL — ADDED TWO ASSOCIATIONS:
+  this.hasMany(models.Flight, {
+    foreignKey: 'departureAirportId',
+    sourceKey: 'code',               ← matches MY 'code' column (not my 'id')
+    as: 'departingFlights',
+    onDelete: 'CASCADE'
+  });
+  this.hasMany(models.Flight, {
+    foreignKey: 'arrivalAirportId',
+    sourceKey: 'code',
+    as: 'arrivingFlights',
+    onDelete: 'CASCADE'
+  });
+
+  sourceKey: 'code' is the hasMany counterpart of targetKey: 'code'.
+  It tells Sequelize: "match flights using MY code column, not MY id column."
+
+
+─── COMPLETE ASSOCIATION MAP (ALL MODELS) ─────────────────────────────────────
+
+  City ──hasMany──► Airport (foreignKey: cityId, CASCADE)
+  Airport ──belongsTo──► City (foreignKey: cityId)
+
+  Airplane ──hasMany──► Flight (foreignKey: airplaneId, CASCADE)
+  Flight ──belongsTo──► Airplane (foreignKey: airplaneId)
+
+  Airport ──hasMany──► Flight as 'departingFlights' (FK: departureAirportId, sourceKey: code)
+  Airport ──hasMany──► Flight as 'arrivingFlights'  (FK: arrivalAirportId,  sourceKey: code)
+  Flight ──belongsTo──► Airport as 'departureAirport' (FK: departureAirportId, targetKey: code)
+  Flight ──belongsTo──► Airport as 'arrivalAirport'   (FK: arrivalAirportId,  targetKey: code)
+
+  CASCADE CHAIN: City → Airport → Flight
+  (Deleting a city cascades through airports to flights)
+
+
+─── REPOSITORY: src/repositories/flight-repository.js ─────────────────────────
+
+PURPOSE: Extends CrudRepository with smart filtering and eager loading.
+
+METHODS:
+  constructor()     — calls super(Flight) to set this.model = Flight
+  getAll(filter)    — OVERRIDDEN: dynamic WHERE clause + sorting + eager loading
+  get(id)           — OVERRIDDEN: eager loading of Airplane + both Airports
+
+INHERITED FROM CrudRepository (not overridden):
+  create(data)      — Flight.create(data)
+  update(data, id)  — Flight.update(data, { where: { id } })
+  destroy(id)       — Flight.destroy({ where: { id } })
+
+getAll(filter) — THE FILTERING ENGINE:
+  This method builds a dynamic Sequelize WHERE clause based on optional filter params.
+
+  STEP 1 — Route filtering:
+    if (filter.departureAirportId) where.departureAirportId = filter.departureAirportId;
+    if (filter.arrivalAirportId)  where.arrivalAirportId = filter.arrivalAirportId;
+    SQL: WHERE departureAirportId = 'DEL' AND arrivalAirportId = 'BOM'
+
+  STEP 2 — Price range:
+    if (filter.minPrice) where.price[Op.gte] = filter.minPrice;  (≥)
+    if (filter.maxPrice) where.price[Op.lte] = filter.maxPrice;  (≤)
+    SQL: WHERE price >= 1000 AND price <= 5000
+
+  STEP 3 — Departure date filtering:
+    Creates a start-of-day (00:00:00) and end-of-day (23:59:59) range.
+    where.departureTime = { [Op.between]: [startOfDay, endOfDay] }
+    SQL: WHERE departureTime BETWEEN '2025-12-25 00:00:00' AND '2025-12-25 23:59:59'
+
+  STEP 4 — Sorting:
+    const sortField = filter.sort || 'departureTime';  (default sort)
+    const sortOrder = filter.order || 'ASC';            (default direction)
+    order: [[sortField, sortOrder]]
+
+  STEP 5 — Eager loading (same for getAll and get):
+    include: [
+      { model: Airplane, attributes: ['id', 'modelNumber', 'capacity'] },
+      { model: Airport, as: 'departureAirport', attributes: ['code', 'name', 'cityId'] },
+      { model: Airport, as: 'arrivalAirport', attributes: ['code', 'name', 'cityId'] }
+    ]
+
+  EXAMPLE API CALL:
+    GET /api/v1/flights?departureAirportId=DEL&arrivalAirportId=BOM&minPrice=1000&maxPrice=5000&sort=price&order=ASC
+
+    This generates:
+      SELECT * FROM Flights
+      WHERE departureAirportId = 'DEL'
+        AND arrivalAirportId = 'BOM'
+        AND price >= 1000 AND price <= 5000
+      ORDER BY price ASC
+      -- with JOINs for Airplane and both Airports
+
+
+─── SERVICE: src/services/flightService.js ────────────────────────────────────
+
+PURPOSE: Business logic layer for flights. Same pattern as other services but
+         with two extra features.
+
+FUNCTIONS:
+  createFlight(data)                  — creates a flight
+  getFlights(filter)                  — passes filter to repository.getAll(filter)
+  getFlight(id)                       — fetches one flight
+  updateFlight(id, data)              — updates a flight (swaps param order for repo)
+  destroyFlight(id)                   — deletes a flight
+  updateRemainingSeats(flightId, seats) — SPECIAL: updates ONLY remainingSeats
+
+updateRemainingSeats PURPOSE:
+  This method exists for the Booking Service (Phase 6) to call.
+  When a user books a seat:
+    1. Booking Service receives the booking request
+    2. Booking Service calls Flight Service: updateRemainingSeats(flightId, newCount)
+    3. Flight Service updates only the remainingSeats column
+  Separating this from updateFlight makes the intent clear and creates a clean
+  inter-service API surface.
+
+All functions follow the same pattern:
+  1. Logger.info() entry log with parameters
+  2. Call repository method inside try block
+  3. Return result on success
+  4. Logger.error() + re-throw on failure
+
+
+─── CONTROLLER: src/controllers/flight-controller.js ──────────────────────────
+
+PURPOSE: HTTP handlers for flight endpoints. 6 handlers (most for any resource).
+
+HANDLERS:
+  createFlight(req, res)   — POST /api/v1/flights
+  getFlights(req, res)     — GET  /api/v1/flights (with query filters)
+  getFlight(req, res)      — GET  /api/v1/flights/:id
+  updateFlight(req, res)   — PATCH /api/v1/flights/:id
+  destroyFlight(req, res)  — DELETE /api/v1/flights/:id
+  updateSeats(req, res)    — PATCH /api/v1/flights/:id/seats
+
+KEY IMPLEMENTATION NOTE — getFlights:
+  Unlike other getAll controllers that simply call service.getAll(), the flight
+  controller builds a FILTER OBJECT from req.query:
+
+    const filter = {
+      departureAirportId: req.query.departureAirportId,    // string
+      arrivalAirportId:   req.query.arrivalAirportId,      // string
+      minPrice: req.query.minPrice ? parseInt(req.query.minPrice) : undefined,
+      maxPrice: req.query.maxPrice ? parseInt(req.query.maxPrice) : undefined,
+      departureTime:      req.query.departureTime,         // ISO date string
+      sort:               req.query.sort,                  // field name
+      order:              req.query.order                  // ASC/DESC
+    };
+
+  WHY parseInt? Query params arrive as STRINGS. "5000" !== 5000. Sequelize's
+  Op.gte/Op.lte operators need numbers for correct comparison. Without parseInt,
+  "5000" > "4500" would be a string comparison (alphabetical), not numeric.
+
+KEY IMPLEMENTATION NOTE — updateSeats:
+  This is a SUB-RESOURCE endpoint: PATCH /flights/:id/seats
+  It only accepts { remainingSeats: 179 } in the body.
+  This follows the Principle of Least Privilege — the Booking Service can
+  update ONLY remainingSeats, not the flight's price/route/times.
+
+RESPONSE FORMAT (consistent across all handlers):
+  {
+    success: true/false,
+    message: "human-readable message",
+    data: { ... } or [],
+    error: {} or "error message"
+  }
+
+
+─── MIDDLEWARE: src/middlewares/flight-middleware.js ────────────────────────────
+
+PURPOSE: Request validation for flight endpoints. Most comprehensive validation.
+
+VALIDATORS:
+
+1. validateCreateRequest — 9 checks:
+   a) flightNumber must be present (string like "AI-302")
+   b) airplaneId must be a positive integer
+   c) departureAirportId must be present
+   d) arrivalAirportId must be present
+   e) departureAirportId !== arrivalAirportId (can't fly in circles!)
+   f) Both departureTime and arrivalTime must be present
+   g) arrivalTime must be AFTER departureTime (can't arrive before departing)
+   h) price must be a positive integer
+   i) totalSeats must be positive, remainingSeats must be non-negative AND ≤ totalSeats
+
+2. validateUpdateRequest — flexible update validation:
+   - At least one of 10 allowed fields must be present
+   - If price is given, must be positive integer
+   - If airplaneId is given, must be positive integer
+
+3. validateUpdateSeatsRequest — minimal validation for booking integration:
+   - remainingSeats must be present and be a non-negative integer
+   (This is all the Booking Service needs to send)
+
+
+─── ROUTES: src/routes/v1/flight-routes.js ────────────────────────────────────
+
+ENDPOINTS:
+  GET    /api/v1/flights              → getFlights (with query param filtering)
+  POST   /api/v1/flights              → createFlight (with validateCreateRequest)
+  GET    /api/v1/flights/:id          → getFlight (with eager loading)
+  PATCH  /api/v1/flights/:id          → updateFlight (with validateUpdateRequest)
+  DELETE /api/v1/flights/:id          → destroyFlight
+  PATCH  /api/v1/flights/:id/seats    → updateSeats (with validateUpdateSeatsRequest)
+
+NOTE: The /seats sub-route uses its OWN validator (validateUpdateSeatsRequest)
+      separate from the general update validator.
+
+
+─── ALL API ENDPOINTS (UPDATED) ───────────────────────────────────────────────
+
+AIRPLANES (5 endpoints):
+  GET    /api/v1/airplanes            → list all airplanes
+  POST   /api/v1/airplanes            → create airplane (with validation)
+  GET    /api/v1/airplanes/:id        → get one airplane
+  PATCH  /api/v1/airplanes/:id        → update airplane (with validation)
+  DELETE /api/v1/airplanes/:id        → delete airplane
+
+CITIES (5 endpoints):
+  GET    /api/v1/cities               → list all cities
+  POST   /api/v1/cities               → create city (with validation)
+  GET    /api/v1/cities/:id           → get one city
+  PATCH  /api/v1/cities/:id           → update city (with validation)
+  DELETE /api/v1/cities/:id           → delete city (CASCADE → airports → flights)
+
+AIRPORTS (5 endpoints):
+  GET    /api/v1/airports             → list all airports (with city data)
+  POST   /api/v1/airports             → create airport (with validation)
+  GET    /api/v1/airports/:id         → get one airport (with city data)
+  PATCH  /api/v1/airports/:id         → update airport (with validation)
+  DELETE /api/v1/airports/:id         → delete airport (CASCADE → flights)
+
+FLIGHTS (6 endpoints):
+  GET    /api/v1/flights              → list flights (FILTERABLE by route, price, date, sort)
+  POST   /api/v1/flights              → create flight (with validation)
+  GET    /api/v1/flights/:id          → get one flight (with airplane + both airports)
+  PATCH  /api/v1/flights/:id          → update flight (with validation)
+  DELETE /api/v1/flights/:id          → delete flight
+  PATCH  /api/v1/flights/:id/seats    → update remaining seats (for booking service)
+
+INFO (1 endpoint):
+  GET    /api/v1/info                 → health check
+
+TOTAL: 22 endpoints
+
+
+─── PHASE 4 TESTING RESULTS ───────────────────────────────────────────────────
+
+All endpoints tested and verified:
+  ✅ POST /flights       — Created flight AI-302 (DEL→BOM, ₹4500) and AI-303 (BOM→DEL, ₹6000)
+  ✅ GET /flights         — Returns all flights with eager-loaded Airplane + Airports
+  ✅ GET /flights?departureAirportId=DEL — Route filter: only DEL departures returned
+  ✅ GET /flights?maxPrice=5000         — Price filter: only ≤₹5000 flights returned
+  ✅ GET /flights?sort=price&order=DESC — Sorting: ₹6000 first, ₹4500 last
+  ✅ GET /flights/1                     — Single flight with full Airplane + Airport data
+  ✅ PATCH /flights/1/seats             — Seats updated 180→179 (booking simulation)
+
+BUG CAUGHT & FIXED DURING TESTING:
+  Initially, GET /flights/1 returned departureAirport: null, arrivalAirport: null.
+  ROOT CAUSE: Sequelize defaults to matching FKs against the primary key (id).
+              But departureAirportId stores "DEL" (a code), not an integer id.
+  FIX: Added targetKey: 'code' to Flight's belongsTo(Airport) associations
+       and sourceKey: 'code' to Airport's hasMany(Flight) associations.
+  This told Sequelize: "match FKs against Airport.code, not Airport.id."
+
+
+────────────────────────────────────────────────────────────────────────────────
+NEW FILE: src/services/airportService.js
+PURPOSE: Business logic layer for Airport operations.
+────────────────────────────────────────────────────────────────────────────────
+
+Same pattern as cityService.js and airplaneService.js. Five functions:
+
+  createAirport(data)       → airportRepository.create(data)
+  getAirports()             → airportRepository.getAll()   [uses OVERRIDDEN version with include]
+  getAirport(id)            → airportRepository.get(id)    [uses OVERRIDDEN version with include]
+  updateAirport(id, data)   → airportRepository.update(data, id)
+  destroyAirport(id)        → airportRepository.destroy(id)
+
+KEY DIFFERENCE: When getAirports() or getAirport() is called, the
+AirportRepository's OVERRIDDEN methods run (not CrudRepository's).
+This means airport data comes back WITH the nested City object.
+
+
+────────────────────────────────────────────────────────────────────────────────
+NEW FILE: src/controllers/city-controller.js
+PURPOSE: HTTP request/response handler for City endpoints.
+────────────────────────────────────────────────────────────────────────────────
+
+Same pattern as airplane-controller.js. Five functions:
+
+  createCity(req, res)    → Extracts { name } from req.body → 201 Created
+  getCities(req, res)     → No params needed → 200 OK with array
+  getCity(req, res)       → Uses req.params.id → 200 or 404
+  updateCity(req, res)    → Uses req.params.id + req.body → 200 or 404
+  destroyCity(req, res)   → Uses req.params.id → 200 or 404
+
+SPECIAL BEHAVIOR ON destroyCity:
+  When a city is deleted, ALL airports in that city are AUTOMATICALLY
+  deleted by MySQL's CASCADE constraint. The controller doesn't need
+  to delete airports manually — the database handles it.
+  
+  Example:
+    DELETE /api/v1/cities/1  (Mumbai)
+    → MySQL deletes City(id=1)
+    → MySQL CASCADE deletes Airport(cityId=1) — all Mumbai airports gone
+    → Response: 200 OK { data: 1, message: "Successfully deleted" }
+
+
+────────────────────────────────────────────────────────────────────────────────
+NEW FILE: src/controllers/airport-controller.js
+PURPOSE: HTTP request/response handler for Airport endpoints.
+────────────────────────────────────────────────────────────────────────────────
+
+Same pattern. Five functions.
+
+IMPORTANT in createAirport:
+  const airport = await AirportService.createAirport({
+    name: req.body.name,
+    code: req.body.code,
+    address: req.body.address,
+    cityId: req.body.cityId
+  });
+  
+  We explicitly extract 4 fields. The cityId is CRITICAL:
+  - If cityId is valid → airport is created, linked to that city
+  - If cityId doesn't exist in Cities table → MySQL throws FK constraint error
+    → catch block returns 500 with error message
+  
+  WHAT THE ERROR LOOKS LIKE:
+    "Cannot add or update a child row: a foreign key constraint fails
+    (`Flights`.`Airports`, CONSTRAINT `Airports_ibfk_1` FOREIGN KEY
+    (`cityId`) REFERENCES `Cities` (`id`) ON DELETE CASCADE)"
+  
+  The middleware catches missing/invalid cityId (is it an integer?),
+  but the DATABASE catches non-existent cityId (does this city exist?).
+  Two levels of protection.
+
+RESPONSE FORMAT for getAirport and getAirports:
+  The response includes NESTED City data (because of the include in repository):
+  {
+    "success": true,
+    "data": {
+      "id": 1,
+      "name": "Chhatrapati Shivaji Maharaj International",
+      "code": "BOM",
+      "address": "Mumbai Airport Road",
+      "cityId": 1,
+      "City": {
+        "id": 1,
+        "name": "Mumbai"
+      }
+    }
+  }
+
+
+────────────────────────────────────────────────────────────────────────────────
+NEW FILE: src/middlewares/city-middleware.js
+PURPOSE: Validates request bodies for City create/update operations.
+────────────────────────────────────────────────────────────────────────────────
+
+FUNCTION: validateCreateRequest(req, res, next)
+  → Checks that req.body.name exists and is non-empty.
+    City only has one editable field (name), so validation is simple.
+    
+    !req.body.name is true if:
+    - name is undefined (not sent)
+    - name is null
+    - name is "" (empty string)
+    - name is 0 (but city names are strings, so this shouldn't happen)
+
+FUNCTION: validateUpdateRequest(req, res, next)
+  → Same check — name must be provided for update.
+    Unlike Airport/Airplane where partial updates make sense (change
+    just capacity or just code), City only has ONE field. If you're
+    updating a city, you must provide the new name.
+
+
+────────────────────────────────────────────────────────────────────────────────
+NEW FILE: src/middlewares/airport-middleware.js
+PURPOSE: Validates request bodies for Airport create/update operations.
+────────────────────────────────────────────────────────────────────────────────
+
+FUNCTION: validateCreateRequest(req, res, next)
+  → THREE required checks:
+  
+  CHECK 1: !req.body.name
+    → Airport name is required (e.g., "Indira Gandhi International Airport")
+  
+  CHECK 2: !req.body.code
+    → IATA code is required (e.g., "DEL")
+    → NOTE: We only check presence here, not format (3 uppercase letters).
+      Format validation could be added later with a regex: /^[A-Z]{3}$/
+  
+  CHECK 3: !req.body.cityId || !Number.isInteger(req.body.cityId) || req.body.cityId <= 0
+    → cityId must be present, must be an integer, must be positive.
+    → This catches: missing, null, "abc", 0, -5, 3.14
+    → But it does NOT check if the city EXISTS in the database.
+      That's the database's job (foreign key constraint).
+    → WHY TWO LEVELS OF VALIDATION?
+      Middleware: fast, cheap, catches obvious bad input (no DB query needed)
+      Database: catches semantic errors (cityId=999 when only 2 cities exist)
+
+FUNCTION: validateUpdateRequest(req, res, next)
+  → For updates, at least ONE field must be provided.
+    Checks: name, code, address, cityId — if ALL are missing, reject.
+    If cityId is provided in an update, it must be a valid positive integer.
+
+
+────────────────────────────────────────────────────────────────────────────────
+NEW FILE: src/routes/v1/city-routes.js
+PURPOSE: Defines HTTP endpoints for City operations.
+────────────────────────────────────────────────────────────────────────────────
+
+ROUTE MAP:
+  GET    /api/v1/cities       → getCities         (no middleware)
+  POST   /api/v1/cities       → validateCreate → createCity
+  GET    /api/v1/cities/:id   → getCity            (no middleware)
+  PATCH  /api/v1/cities/:id   → validateUpdate → updateCity
+  DELETE /api/v1/cities/:id   → destroyCity        (no middleware)
+
+Same pattern as airplane-routes.js. Middleware only on POST and PATCH
+because those are the only methods that send a request body.
+
+
+────────────────────────────────────────────────────────────────────────────────
+NEW FILE: src/routes/v1/airport-routes.js
+PURPOSE: Defines HTTP endpoints for Airport operations.
+────────────────────────────────────────────────────────────────────────────────
+
+ROUTE MAP:
+  GET    /api/v1/airports       → getAirports       (no middleware)
+  POST   /api/v1/airports       → validateCreate → createAirport
+  GET    /api/v1/airports/:id   → getAirport         (no middleware)
+  PATCH  /api/v1/airports/:id   → validateUpdate → updateAirport
+  DELETE /api/v1/airports/:id   → destroyAirport     (no middleware)
+
+Same pattern. GET responses include nested City data.
+
+
+────────────────────────────────────────────────────────────────────────────────
+UPDATED: All barrel export files (index.js)
+PURPOSE: Wire new City and Airport modules into the existing application.
+
+
+================================================================================
+9. PHASE 8 CHANGELOG — API Gateway Features Added to Flight Service
+================================================================================
+
+Since Phases 6 (Booking Service) and 7 (Auth Service) were skipped, there is
+no separate API Gateway to build. Instead, Phase 8 added gateway-like features
+directly into the Flight Service so it's production-ready as a standalone API.
+
+WHAT IS AN API GATEWAY?
+  In a microservices architecture, an API Gateway is a single entry point that
+  sits in front of all services. It handles cross-cutting concerns like:
+    - Authentication & authorization (API keys, JWT tokens)
+    - Rate limiting (throttle abusive clients)
+    - CORS (cross-origin browser requests)
+    - Request tracing (unique IDs for debugging)
+    - API documentation (Swagger/OpenAPI)
+    - Load balancing & routing to downstream services
+
+  Since we only have ONE service, we baked these features INTO the Flight
+  Service rather than creating a separate gateway project.
+
+────────────────────────────────────────────────────────────────────────────────
+DEPENDENCIES INSTALLED
+────────────────────────────────────────────────────────────────────────────────
+
+  npm install cors swagger-jsdoc swagger-ui-express uuid
+
+  cors             → Enables Cross-Origin Resource Sharing headers
+  swagger-jsdoc    → Generates OpenAPI 3.0 spec from JSDoc comments in routes
+  swagger-ui-express → Serves interactive Swagger UI at /api-docs
+  uuid             → Generates UUID v4 strings for request tracing
+
+
+================================================================================
+9.1 CORS — Cross-Origin Resource Sharing
+================================================================================
+
+FILE: src/index.js
+WHAT: Added `app.use(cors())` to the middleware chain.
+
+WHY:
+  Browsers enforce the Same-Origin Policy — a frontend at http://localhost:5173
+  cannot fetch from http://localhost:3000/api unless the server explicitly
+  allows it with CORS headers. Without CORS, frontend apps get:
+    "Access to fetch has been blocked by CORS policy"
+
+HOW IT WORKS:
+  The cors() middleware adds these headers to every response:
+    Access-Control-Allow-Origin: *          (any origin allowed)
+    Access-Control-Allow-Methods: GET,POST,PUT,DELETE,PATCH,OPTIONS
+    Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key
+
+  For preflight OPTIONS requests, it responds with 204 No Content + headers.
+
+WHERE IN THE CHAIN:
+  Request ID → Helmet → CORS → Rate Limiter → Body Parsers → ...
+
+  CORS goes early so OPTIONS preflight requests are handled before any
+  business logic runs.
+
+
+================================================================================
+9.2 SWAGGER / OPENAPI DOCUMENTATION
+================================================================================
+
+FILE: src/config/swagger-config.js
+PURPOSE: Defines the OpenAPI 3.0 specification for the entire API.
+
+LINE-BY-LINE:
+
+  const swaggerJsdoc = require('swagger-jsdoc');
+    → The library that scans JSDoc comments in your route files and
+      generates a JSON specification object.
+
+  const options = {
+    definition: {
+      openapi: '3.0.0',
+        → Declares we're using OpenAPI version 3.0.0 (the modern standard).
+
+      info: {
+        title: 'Flight Service API',
+        version: '1.0.0',
+        description: '...',
+        → Metadata shown at the top of the Swagger UI page.
+
+      servers: [{ url: '/api/v1', description: 'Version 1' }],
+        → Tells Swagger that all endpoints are relative to /api/v1.
+          So a path "/airplanes" in the spec means /api/v1/airplanes.
+
+      components: {
+        securitySchemes: { ApiKeyAuth: { type: 'apiKey', in: 'header', name: 'x-api-key' } },
+          → Documents the API key authentication method.
+
+        schemas: { City, Airport, Airplane, Flight, SuccessResponse, ErrorResponse },
+          → Reusable data models. Each schema defines the shape of a
+            JSON object (properties, types, examples).
+      }
+    },
+    apis: ['./src/routes/v1/*.js']
+      → Tells swagger-jsdoc WHERE to look for JSDoc annotations.
+        It scans all .js files in src/routes/v1/ for @swagger comments.
+  };
+
+  const swaggerSpec = swaggerJsdoc(options);
+    → Builds the final OpenAPI JSON spec by merging the definition above
+      with all @swagger annotations found in route files.
+
+  module.exports = swaggerSpec;
+    → Exported so index.js can pass it to swagger-ui-express.
+
+────────────────────────────────────────────────────────────────────────────────
+
+HOW SWAGGER ANNOTATIONS WORK (in route files):
+
+  Each route file (airplane-routes.js, city-routes.js, airport-routes.js,
+  flight-routes.js, v1/index.js) now has JSDoc comments like:
+
+    /**
+     * @swagger
+     * /airplanes:
+     *   get:
+     *     summary: Get all airplanes
+     *     tags: [Airplanes]
+     *     responses:
+     *       200:
+     *         description: List of airplanes
+     *   post:
+     *     summary: Create an airplane
+     *     tags: [Airplanes]
+     *     requestBody:
+     *       required: true
+     *       content:
+     *         application/json:
+     *           schema:
+     *             type: object
+     *             required: [modelNumber, capacity]
+     *             properties:
+     *               modelNumber: { type: string }
+     *               capacity: { type: integer }
+     */
+
+  swagger-jsdoc parses these YAML blocks and adds them to the spec.
+  Tags group endpoints in the Swagger UI sidebar:
+    - Airplanes (5 endpoints)
+    - Cities (5 endpoints)
+    - Airports (5 endpoints)
+    - Flights (6 endpoints)
+    - Health (1 endpoint)
+
+────────────────────────────────────────────────────────────────────────────────
+
+WIRED IN src/index.js:
+
+  const swaggerUi = require('swagger-ui-express');
+  const swaggerSpec = require('./config/swagger-config');
+
+  app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
+      customCss: '.swagger-ui .topbar { display: none }',
+      customSiteTitle: 'Flight Service API Docs'
+  }));
+
+  → Mounts interactive API docs at http://localhost:3000/api-docs
+  → customCss hides the default Swagger topbar
+  → Placed BEFORE the API key gate so docs are publicly accessible
+
+
+================================================================================
+9.3 API KEY AUTHENTICATION MIDDLEWARE
+================================================================================
+
+FILE: src/middlewares/api-key-middleware.js
+PURPOSE: Optional authentication gate for all /api/* routes.
+
+LINE-BY-LINE:
+
+  const { serverConfig, Logger } = require('../config');
+    → serverConfig.API_KEY reads from process.env.API_KEY (set in .env).
+
+  function validateApiKey(req, res, next) {
+
+    if (!serverConfig.API_KEY) {
+        return next();
+    }
+      → CRITICAL: If API_KEY is empty or unset in .env, the middleware
+        does NOTHING — it calls next() and moves on. This means API key
+        enforcement is DISABLED by default. You opt in by setting a key.
+
+    const clientKey = req.headers['x-api-key'];
+      → Reads the API key from the x-api-key HTTP header.
+        Not from query params (insecure — shows in URLs/logs).
+        Not from the body (awkward for GET requests).
+
+    if (!clientKey) {
+        return res.status(401).json({ ... 'API key is required' ... });
+    }
+      → 401 Unauthorized: Client sent no key at all.
+
+    if (clientKey !== serverConfig.API_KEY) {
+        return res.status(403).json({ ... 'Invalid API key' ... });
+    }
+      → 403 Forbidden: Client sent a key, but it's wrong.
+        Uses constant-time comparison via === (acceptable for
+        single-key setups; for multi-key, use crypto.timingSafeEqual).
+
+    next();
+      → Key matches — let the request through.
+  }
+
+HOW TO USE:
+  1. In .env, set: API_KEY=my-secret-key-here
+  2. Restart the server
+  3. All /api/* requests now require: x-api-key: my-secret-key-here
+  4. The dashboard UI at "/" and Swagger at "/api-docs" are NOT gated
+
+WHERE IN THE CHAIN:
+  ... → Swagger UI → Static Files → API Key Gate → API Routes → ...
+
+  API key check happens AFTER Swagger and static files are served so
+  documentation and the dashboard remain accessible without a key.
+
+
+================================================================================
+9.4 REQUEST ID TRACING
+================================================================================
+
+FILE: src/middlewares/request-id-middleware.js
+PURPOSE: Assigns a unique ID to every request for log correlation.
+
+LINE-BY-LINE:
+
+  const { v4: uuidv4 } = require('uuid');
+    → uuid v4 generates random 128-bit UUIDs like:
+      "47e9f16e-6a21-4118-bc64-83c10f481324"
+
+  function attachRequestId(req, res, next) {
+    req.id = req.headers['x-request-id'] || uuidv4();
+      → If the client already sent an x-request-id header (common in
+        microservices where the gateway generates the ID), we REUSE it.
+        Otherwise, we generate a new UUID.
+
+    res.setHeader('x-request-id', req.id);
+      → Echo the request ID back in the response headers so the client
+        can reference it in bug reports or support tickets.
+
+    next();
+  }
+
+WHY REQUEST IDs MATTER:
+  When you have thousands of requests in your logs, finding the ones
+  related to a specific user complaint is impossible without a unique ID.
+  
+  With request IDs:
+    Client sends: POST /api/v1/flights → gets back x-request-id: abc-123
+    Client reports: "Flight creation failed, request ID: abc-123"
+    Developer searches logs: grep "abc-123" → finds the exact request path
+
+WHERE IN THE CHAIN:
+  Request ID → Helmet → CORS → ... (FIRST middleware so every log entry
+  downstream can include req.id for correlation)
+
+
+================================================================================
+9.5 ENHANCED HEALTH CHECK ENDPOINT
+================================================================================
+
+FILE: src/controllers/info-controller.js
+PURPOSE: GET /api/v1/info — returns server health with metrics.
+
+BEFORE (Phase 1-5):
+  Returned a static { success: true, message: 'api is working' }
+
+AFTER (Phase 8):
+
+  async function info(req, res, next) {
+    try {
+      let dbStatus = 'healthy';
+      try {
+          await db.sequelize.authenticate();
+      } catch {
+          dbStatus = 'unhealthy';
+      }
+        → Pings the database with a lightweight SELECT 1 query.
+          If it fails (MySQL is down, credentials wrong, etc.),
+          sets dbStatus to 'unhealthy' instead of crashing.
+
+      const memoryUsage = process.memoryUsage();
+        → Node.js built-in: returns RSS (total memory), heap used/total.
+
+      return res.json({
+        success: true,
+        message: 'API is working',
+        data: {
+          uptime: Math.floor(process.uptime()),
+            → Seconds since the Node.js process started.
+
+          database: dbStatus,
+            → 'healthy' or 'unhealthy'
+
+          memory: {
+            rss: '65 MB',
+              → Resident Set Size: total memory allocated to the process.
+            heapUsed: '23 MB'
+              → V8 heap memory actually in use.
+          },
+
+          timestamp: new Date().toISOString()
+            → Current server time in ISO format.
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+
+================================================================================
+9.6 SECURITY FIX — Sort Field Injection
+================================================================================
+
+FILE: src/repositories/flight-repository.js
+ISSUE: User input (query param ?sort=...) was used directly as a SQL column
+       name without validation. An attacker could inject arbitrary SQL.
+
+BEFORE:
+  const sortField = filter.sort || 'departureTime';
+  → ANY string from the query param goes directly into ORDER BY.
+
+AFTER:
+  const allowedSortFields = ['departureTime', 'arrivalTime', 'price',
+    'flightNumber', 'totalSeats', 'remainingSeats', 'createdAt'];
+  const sortField = allowedSortFields.includes(filter.sort)
+    ? filter.sort : 'departureTime';
+  → Only whitelisted column names are accepted. Anything else defaults
+    to 'departureTime'. Same pattern applied to sort order (ASC/DESC only).
+
+
+================================================================================
+9.7 UPDATED MIDDLEWARE CHAIN (src/index.js)
+================================================================================
+
+The full middleware execution order from top to bottom:
+
+  1. attachRequestId    → Assigns UUID to every request (req.id)
+  2. helmet()           → Sets secure HTTP headers (CSP, HSTS, X-Frame-Options)
+  3. cors()             → Adds CORS headers for cross-origin browser requests
+  4. rateLimit          → Throttles /api/* to 100 requests per 15 minutes per IP
+  5. express.json()     → Parses JSON request bodies
+  6. express.urlencoded → Parses URL-encoded form bodies
+  7. swagger-ui         → Serves /api-docs (interactive API documentation)
+  8. express.static     → Serves dashboard UI from src/public/
+  9. validateApiKey     → Checks x-api-key header (ONLY if API_KEY is set)
+  10. apirouter         → Routes /api/v1/* to controllers
+  11. globalErrorHandler → Catches all errors, returns consistent JSON
+
+  Note: Order matters! Swagger and static files are served BEFORE the API key
+  gate so they remain accessible without authentication.
+
+
+================================================================================
+9.8 COMPLETE API REFERENCE (22 Endpoints + Docs)
+================================================================================
+
+  BASE URL: http://localhost:3000
+
+  DOCUMENTATION:
+    GET  /api-docs              → Interactive Swagger UI (no auth required)
+
+  HEALTH:
+    GET  /api/v1/info           → Server health (uptime, DB, memory)
+
+  CITIES (5):
+    GET    /api/v1/cities       → List all cities
+    POST   /api/v1/cities       → Create city { name }
+    GET    /api/v1/cities/:id   → Get city by ID
+    PATCH  /api/v1/cities/:id   → Update city { name }
+    DELETE /api/v1/cities/:id   → Delete city (cascades to airports)
+
+  AIRPORTS (5):
+    GET    /api/v1/airports     → List all airports (includes City data)
+    POST   /api/v1/airports     → Create airport { name, code, address, cityId }
+    GET    /api/v1/airports/:id → Get airport by ID (includes City data)
+    PATCH  /api/v1/airports/:id → Update airport
+    DELETE /api/v1/airports/:id → Delete airport
+
+  AIRPLANES (5):
+    GET    /api/v1/airplanes     → List all airplanes
+    POST   /api/v1/airplanes     → Create airplane { modelNumber, capacity }
+    GET    /api/v1/airplanes/:id → Get airplane by ID
+    PATCH  /api/v1/airplanes/:id → Update airplane
+    DELETE /api/v1/airplanes/:id → Delete airplane
+
+  FLIGHTS (6):
+    GET    /api/v1/flights              → List flights (with filters below)
+    POST   /api/v1/flights              → Create flight (9 required fields)
+    GET    /api/v1/flights/:id          → Get flight (includes Airplane + Airports)
+    PATCH  /api/v1/flights/:id          → Update flight fields
+    DELETE /api/v1/flights/:id          → Delete flight
+    PATCH  /api/v1/flights/:id/seats    → Update remaining seats { remainingSeats }
+
+  FLIGHT FILTERS (query params on GET /api/v1/flights):
+    ?departureAirportId=DEL             → Filter by departure airport code
+    ?arrivalAirportId=BOM               → Filter by arrival airport code
+    ?minPrice=1000&maxPrice=5000        → Price range
+    ?departureTime=2026-04-15           → Flights on a specific date
+    ?sort=price&order=DESC              → Sort by field (7 allowed fields)
+
+  HEADERS:
+    x-api-key: <key>                    → Required only if API_KEY is set in .env
+    x-request-id: <uuid>                → Optional; echoed back in response
+
+================================================================================
+END OF PHASE 8 DOCUMENTATION
+================================================================================
+────────────────────────────────────────────────────────────────────────────────
+
+REPOSITORIES: src/repositories/index.js
+  ADDED: CityRepository, AirportRepository exports
+  NOW EXPORTS: { AirplaneRepository, CityRepository, AirportRepository }
+
+SERVICES: src/services/index.js
+  ADDED: CityService, AirportService exports
+  NOW EXPORTS: { AirplaneService, CityService, AirportService }
+
+CONTROLLERS: src/controllers/index.js
+  ADDED: Citycontroller, Airportcontroller exports
+  NOW EXPORTS: { Infocontroller, Airplanecontroller, Citycontroller, Airportcontroller }
+
+MIDDLEWARES: src/middlewares/index.js
+  ADDED: CityMiddleware, AirportMiddleware exports
+  NOW EXPORTS: { AirplaneMiddleware, CityMiddleware, AirportMiddleware }
+
+ROUTES: src/routes/v1/index.js
+  ADDED: router.use('/cities', cityRoutes)
+         router.use('/airports', airportRoutes)
+  
+  FULL ROUTE TREE NOW:
+    /api
+      └── /v1
+            ├── /airplanes    → 5 endpoints (GET, POST, GET/:id, PATCH/:id, DELETE/:id)
+            ├── /cities       → 5 endpoints (GET, POST, GET/:id, PATCH/:id, DELETE/:id)
+            ├── /airports     → 5 endpoints (GET, POST, GET/:id, PATCH/:id, DELETE/:id)
+            └── /info         → 1 endpoint  (GET)
+
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 3: COMPLETE REQUEST FLOW EXAMPLES
+────────────────────────────────────────────────────────────────────────────────
+
+EXAMPLE 1: Create a City, then create an Airport in that City
+
+  Step 1: POST /api/v1/cities
+          Body: { "name": "Mumbai" }
+          
+          Flow:
+          → Middleware checks: name exists? YES ("Mumbai") → next()
+          → Controller extracts: { name: "Mumbai" }
+          → Service calls: cityRepository.create({ name: "Mumbai" })
+          → Repository calls: City.create({ name: "Mumbai" })
+          → SQL: INSERT INTO Cities (name, createdAt, updatedAt) VALUES ('Mumbai', NOW(), NOW())
+          → Response: 201 Created { id: 1, name: "Mumbai", ... }
+  
+  Step 2: POST /api/v1/airports
+          Body: { "name": "CSMI Airport", "code": "BOM", "address": "Airport Road", "cityId": 1 }
+          
+          Flow:
+          → Middleware checks: name? YES. code? YES. cityId = 1 (positive int)? YES → next()
+          → Controller extracts: { name, code, address, cityId }
+          → Service calls: airportRepository.create(data)
+          → Repository calls: Airport.create(data)  [inherited from CrudRepository]
+          → SQL: INSERT INTO Airports (name, code, address, cityId, ...) VALUES ('CSMI Airport', 'BOM', 'Airport Road', 1, ...)
+          → MySQL checks: Does cityId=1 exist in Cities? YES → INSERT succeeds
+          → Response: 201 Created { id: 1, name: "CSMI Airport", code: "BOM", cityId: 1, ... }
+
+EXAMPLE 2: Fetch an Airport (with City data)
+
+  GET /api/v1/airports/1
+  
+  Flow:
+  → Controller calls: AirportService.getAirport(1)
+  → Service calls: airportRepository.get(1)
+  → AirportRepository's OVERRIDDEN get() runs (NOT CrudRepository's)
+  → Calls: Airport.findByPk(1, { include: [{ model: City, attributes: ['id', 'name'] }] })
+  → SQL: SELECT Airports.*, Cities.id, Cities.name FROM Airports
+          LEFT OUTER JOIN Cities ON Airports.cityId = Cities.id
+          WHERE Airports.id = 1
+  → Returns: { id: 1, name: "CSMI Airport", code: "BOM", cityId: 1, City: { id: 1, name: "Mumbai" } }
+  → Response: 200 OK with nested City data
+
+EXAMPLE 3: Delete a City (CASCADE deletes airports)
+
+  DELETE /api/v1/cities/1
+  
+  Flow:
+  → Controller calls: CityService.destroyCity(1)
+  → Service calls: cityRepository.destroy(1)
+  → CrudRepository.destroy(1) calls: City.destroy({ where: { id: 1 } })
+  → SQL: DELETE FROM Cities WHERE id = 1
+  → MySQL CASCADE: DELETE FROM Airports WHERE cityId = 1 (automatic!)
+  → Both the city AND all its airports are gone
+  → Response: 200 OK { data: 1 }
+
+EXAMPLE 4: Try to create Airport with non-existent city
+
+  POST /api/v1/airports
+  Body: { "name": "Ghost Airport", "code": "GHO", "cityId": 999 }
+  
+  Flow:
+  → Middleware checks: name? YES. code? YES. cityId = 999 (positive int)? YES → next()
+     (Middleware can't check if city 999 EXISTS — that requires a DB query)
+  → Controller → Service → Repository → Airport.create(data)
+  → SQL: INSERT INTO Airports (name, code, cityId, ...) VALUES ('Ghost Airport', 'GHO', 999, ...)
+  → MySQL says: FOREIGN KEY CONSTRAINT VIOLATION!
+     "Cannot add or update a child row: a foreign key constraint fails"
+  → Error is thrown → Repository logs error → Service logs error → Controller catches it
+  → Response: 500 Internal Server Error { error: "Cannot add or update..." }
+
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 3: NEW API ENDPOINTS
+────────────────────────────────────────────────────────────────────────────────
+
+CITY ENDPOINTS:
+
+  POST /api/v1/cities
+    Body: { "name": "Mumbai" }
+    Response: 201 Created
+    { "success": true, "data": { "id": 1, "name": "Mumbai", ... } }
+
+  GET /api/v1/cities
+    Response: 200 OK
+    { "success": true, "data": [{ "id": 1, "name": "Mumbai" }, { "id": 2, "name": "Delhi" }] }
+
+  GET /api/v1/cities/:id
+    Response: 200 OK or 404 Not Found
+
+  PATCH /api/v1/cities/:id
+    Body: { "name": "Navi Mumbai" }
+    Response: 200 OK or 404 Not Found
+
+  DELETE /api/v1/cities/:id
+    Response: 200 OK or 404 Not Found
+    SIDE EFFECT: All airports in this city are CASCADE deleted!
+
+AIRPORT ENDPOINTS:
+
+  POST /api/v1/airports
+    Body: { "name": "CSMI Airport", "code": "BOM", "address": "Airport Road", "cityId": 1 }
+    Response: 201 Created
+    Error: 500 if cityId doesn't exist in Cities table
+
+  GET /api/v1/airports
+    Response: 200 OK — includes nested City data:
+    { "data": [{ "id": 1, "name": "CSMI Airport", "code": "BOM", "City": { "id": 1, "name": "Mumbai" } }] }
+
+  GET /api/v1/airports/:id
+    Response: 200 OK (with nested City) or 404
+
+  PATCH /api/v1/airports/:id
+    Body: { "code": "BOM2" } (partial update)
+    Response: 200 OK or 404
+
+  DELETE /api/v1/airports/:id
+    Response: 200 OK or 404
+
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 3: FILES CREATED
+────────────────────────────────────────────────────────────────────────────────
+
+NEW FILES (10):
+  src/migrations/20260402100000-create-city.js      ← City table migration
+  src/migrations/20260402100001-create-airport.js    ← Airport table migration
+  src/models/city.js                                 ← City Sequelize model
+  src/models/airport.js                              ← Airport Sequelize model
+  src/repositories/city-repository.js                ← City repository
+  src/repositories/airport-repository.js             ← Airport repository (with overrides)
+  src/services/cityService.js                        ← City service
+  src/services/airportService.js                     ← Airport service
+  src/controllers/city-controller.js                 ← City controller
+  src/controllers/airport-controller.js              ← Airport controller
+  src/middlewares/city-middleware.js                  ← City validation middleware
+  src/middlewares/airport-middleware.js               ← Airport validation middleware
+  src/routes/v1/city-routes.js                       ← City route definitions
+  src/routes/v1/airport-routes.js                    ← Airport route definitions
+
+UPDATED FILES (5):
+  src/repositories/index.js    ← Added CityRepository, AirportRepository exports
+  src/services/index.js        ← Added CityService, AirportService exports
+  src/controllers/index.js     ← Added Citycontroller, Airportcontroller exports
+  src/middlewares/index.js     ← Added CityMiddleware, AirportMiddleware exports
+  src/routes/v1/index.js       ← Mounted /cities and /airports routes
+
+TOTAL ENDPOINT COUNT: 16
+  /api/v1/info          (1)
+  /api/v1/airplanes/*   (5)
+  /api/v1/cities/*      (5)
+  /api/v1/airports/*    (5)
+
+
+================================================================================
+                 PHASE 5: ENVIRONMENT & SECURITY HARDENING
+================================================================================
+
+OVERVIEW:
+  Phase 5 makes the application production-ready by:
+  1. Moving ALL secrets from hardcoded config.json to .env file
+  2. Converting config.json → config.js (JS can read environment variables, JSON cannot)
+  3. Wiring AppError class into all services for proper HTTP status codes
+  4. Creating a global error handler middleware (single error response point)
+  5. Simplifying controllers (removed duplicate error handling)
+  6. Adding Helmet (security headers) and express-rate-limit (DoS protection)
+  7. Creating .env.example for onboarding new developers
+
+NEW FILES CREATED:
+  1. src/config/config.js                           — Sequelize config reading from env vars
+  2. src/middlewares/global-error-handler.js         — Central error response handler
+  3. .env.example                                    — Template for environment variables
+
+MODIFIED FILES:
+  4. .env                                            — Added DB_USERNAME, DB_PASSWORD, DB_NAME, DB_HOST, DB_DIALECT
+  5. src/config/server-config.js                     — Explicit .env path + PORT fallback
+  6. src/models/index.js                             — Changed config.json → config.js
+  7. src/utils/errors/app-error.js                   — Added this.name = 'AppError'
+  8. src/utils/index.js                              — Now exports AppError
+  9. src/services/airplaneService.js                 — Added AppError + status code classification
+  10. src/services/cityService.js                    — Added AppError + status code classification
+  11. src/services/airportService.js                 — Added AppError + status code + FK error handling
+  12. src/services/flightService.js                  — Added AppError + status code + FK error handling
+  13. src/controllers/airplane-controller.js          — Simplified with next(error)
+  14. src/controllers/city-controller.js              — Simplified with next(error)
+  15. src/controllers/airport-controller.js           — Simplified with next(error)
+  16. src/controllers/flight-controller.js            — Simplified with next(error)
+  17. src/index.js                                   — Added helmet, rateLimit, globalErrorHandler
+  18. package.json                                   — Updated migration scripts for config.js
+  19. .gitignore                                     — Removed config.json reference
+
+DELETED FILES:
+  None (config.json left in place as fallback reference, but no longer used)
+
+
+─── SECURITY: .env FILE ───────────────────────────────────────────────────────
+
+BEFORE (.env):
+  PORT = 3000
+
+AFTER (.env):
+  PORT=3000
+  DB_USERNAME=root
+  DB_PASSWORD=ankit0709
+  DB_NAME=Flights
+  DB_HOST=127.0.0.1
+  DB_DIALECT=mysql
+
+WHY THIS MATTERS:
+  Previously, the database password "ankit0709" was hardcoded in config.json.
+  If this repo were pushed to GitHub (even accidentally), the password would be
+  exposed permanently in Git history. Now:
+  - .env has the real secrets and is in .gitignore (NEVER committed)
+  - .env.example has placeholder values and IS committed (shows teammates what's needed)
+  - config.js reads from process.env, so no secrets in source code
+
+SECURITY CHAIN:
+  .env → dotenv loads into process.env → config.js reads process.env → Sequelize uses config
+
+
+─── SECURITY: src/config/config.js (replaces config.json) ────────────────────
+
+BEFORE (config.json — static, secrets exposed):
+  { "development": { "password": "ankit0709", ... } }
+
+AFTER (config.js — dynamic, reads from environment):
+  module.exports = {
+    development: {
+      username: process.env.DB_USERNAME || 'root',
+      password: process.env.DB_PASSWORD || null,
+      database: process.env.DB_NAME || 'Flights',
+      host: process.env.DB_HOST || '127.0.0.1',
+      dialect: process.env.DB_DIALECT || 'mysql'
+    },
+    test: { ... },
+    production: { ... }
+  };
+
+KEY: require('dotenv').config() is called at the top, so env vars are available.
+FALLBACKS: || 'root' provides defaults if env var is missing (useful for CI/CD).
+JSON → JS: Sequelize CLI supports both. models/index.js was updated to require config.js.
+
+
+─── SECURITY: server-config.js UPDATE ─────────────────────────────────────────
+
+BEFORE:
+  const dotenv = require('dotenv');
+  dotenv.config();
+  module.exports = { PORT: process.env.PORT }
+
+AFTER:
+  const dotenv = require('dotenv');
+  const path = require('path');
+  dotenv.config({ path: path.resolve(__dirname, '../../.env') });
+  module.exports = { PORT: process.env.PORT || 3000 }
+
+CHANGES:
+  1. path.resolve(__dirname, '../../.env') — ensures .env is found regardless of
+     where 'node' is invoked from. __dirname is always the folder of this file.
+  2. || 3000 — fallback default port if PORT isn't in .env.
+
+
+─── SECURITY: AppError CLASS ──────────────────────────────────────────────────
+
+FILE: src/utils/errors/app-error.js
+
+  class AppError extends Error {
+    constructor(message, statusCode) {
+      super(message);            // Sets this.message (standard Error property)
+      this.name = 'AppError';    // NEW: helps identify in logs + instanceof checks
+      this.statusCode = statusCode; // HTTP status code (400, 404, 500, etc.)
+      this.explanation = message;   // Human-readable explanation
+    }
+  }
+
+  EXPORTED FROM: src/utils/index.js → { AppError }
+
+  USAGE: throw new AppError('Airplane with id 99 not found', 404);
+
+
+─── ARCHITECTURE: ERROR FLOW (BEFORE vs AFTER) ────────────────────────────────
+
+BEFORE Phase 5:
+  Request → Middleware → Controller → Service → Repository → DB
+                              ↓ (catch)
+                         Controller builds 500 response manually
+                              ↓
+                         res.status(500).json({ error: error.message })
+
+  PROBLEMS:
+  - Every controller had copy-pasted error handling (~30 lines each × 20 handlers)
+  - Every error returned 500, even for 400 (validation) or 404 (not found)
+  - Not-found checks were duplicated in both service AND controller
+  - Raw error messages exposed to client (potential info leak)
+
+AFTER Phase 5:
+  Request → Middleware → Controller → Service → Repository → DB
+                              ↓ (service throws AppError)
+                         Controller calls next(error)
+                              ↓
+                         Express routes to globalErrorHandler
+                              ↓
+                         globalErrorHandler reads err.statusCode + err.explanation
+                              ↓
+                         res.status(statusCode).json({ formatted response })
+
+  BENEFITS:
+  - Error classification happens ONCE in service layer
+  - Controllers are ~50% smaller (just happy path + next(error))
+  - Proper HTTP status codes (400, 404, 500) instead of always 500
+  - Single error format in one place (easy to change globally)
+  - Logger.error is called once in globalErrorHandler (not duplicated)
+
+
+─── SERVICE LAYER: AppError CLASSIFICATION ─────────────────────────────────────
+
+Every service now classifies errors by type:
+
+  ERROR TYPE                       → STATUS CODE
+  SequelizeValidationError         → 400 Bad Request
+  SequelizeUniqueConstraintError   → 400 Bad Request
+  SequelizeForeignKeyConstraintError → 400 Bad Request
+  Result is null (not found)       → 404 Not Found
+  Update affected 0 rows           → 404 Not Found
+  Destroy affected 0 rows          → 404 Not Found
+  Everything else                  → 500 Internal Server Error
+
+  PATTERN: Every service catch block does:
+    1. Check if error is already AppError → re-throw unchanged
+    2. Check if SequelizeValidation/Unique → wrap in AppError(message, 400)
+    3. Check if SequelizeFK → wrap in AppError('Referenced X does not exist', 400)
+    4. Default → wrap in AppError('Cannot do X', 500)
+
+  WHY 'if (error instanceof AppError) throw error':
+    When a not-found AppError is thrown inside the TRY block, it immediately
+    enters the CATCH block. Without this guard, the catch would wrap our 404
+    inside a new 500 AppError. The instanceof check passes it through unchanged.
+
+
+─── CONTROLLER LAYER: SIMPLIFICATION ──────────────────────────────────────────
+
+BEFORE (every handler ~40 lines):
+  async function getAirplane(req, res) {
+    try {
+      const airplane = await service.getAirplane(id);
+      if (!airplane) {
+        Logger.warn('not found', { id });
+        return res.status(404).json({...});       ← duplicate null check
+      }
+      return res.status(200).json({...});
+    } catch (error) {
+      Logger.error('failed', { error });
+      return res.status(500).json({...});          ← always 500
+    }
+  }
+
+AFTER (every handler ~15 lines):
+  async function getAirplane(req, res, next) {
+    try {
+      const airplane = await service.getAirplane(id);
+      return res.status(200).json({...});          ← happy path only
+    } catch (error) {
+      next(error);                                 ← delegate to global handler
+    }
+  }
+
+  CHANGES:
+  1. Added 'next' as 3rd parameter → (req, res, next)
+  2. Removed null/zero checks → service now throws AppError(404)
+  3. Removed Logger.error in catch → global handler logs it
+  4. Removed res.status(500) catch blocks → next(error) delegates
+
+
+─── GLOBAL ERROR HANDLER: src/middlewares/global-error-handler.js ─────────────
+
+  function globalErrorHandler(err, req, res, next) {
+    Logger.error('Global error handler caught an error', {
+      name: err.name, message: err.message, statusCode: err.statusCode,
+      path: req.path, method: req.method
+    });
+    const statusCode = err.statusCode || 500;
+    const message = err.explanation || err.message || 'Something went wrong';
+    return res.status(statusCode).json({
+      success: false, message, data: {},
+      error: { statusCode, explanation: message }
+    });
+  }
+
+  WHY 4 PARAMETERS:
+    Express uses the parameter count to identify error handlers.
+    3 params = normal middleware: (req, res, next)
+    4 params = error handler: (err, req, res, next)
+    Even if you don't use 'next', you MUST include it.
+
+  MUST BE REGISTERED AFTER ALL ROUTES:
+    app.use('/api', router);           ← routes first
+    app.use(globalErrorHandler);        ← error handler last
+    If it were before routes, errors would never reach it.
+
+  FALLBACK LOGIC:
+    err.statusCode exists → AppError → use it (400, 404, etc.)
+    err.statusCode missing → unknown error → default to 500
+
+
+─── SECURITY: Helmet ──────────────────────────────────────────────────────────
+
+  app.use(helmet());
+
+  Helmet sets ~15 HTTP security headers automatically:
+    Content-Security-Policy: default-src 'self'     → prevents XSS via inline scripts
+    X-Content-Type-Options: nosniff                 → prevents MIME type sniffing
+    X-Frame-Options: SAMEORIGIN                     → prevents clickjacking
+    Strict-Transport-Security: max-age=31536000     → forces HTTPS for 1 year
+    X-DNS-Prefetch-Control: off                     → prevents DNS prefetch attacks
+    X-Download-Options: noopen                      → IE download protection
+    Referrer-Policy: no-referrer                    → prevents referrer leaking
+    Cross-Origin-Opener-Policy: same-origin         → prevents cross-origin attacks
+    Removes X-Powered-By header                     → hides that you use Express
+
+
+─── SECURITY: Rate Limiting ───────────────────────────────────────────────────
+
+  const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000,    // 15-minute window
+    max: 100,                     // 100 requests per IP per window
+    standardHeaders: true,        // Send RateLimit-* headers
+    legacyHeaders: false,
+    message: { success: false, message: 'Too many requests...' }
+  });
+  app.use('/api', limiter);
+
+  HOW IT WORKS:
+  - Tracks requests per IP address using an in-memory store
+  - After 100 requests in 15 minutes, returns 429 Too Many Requests
+  - Sends headers so clients know their remaining quota:
+      RateLimit-Limit: 100
+      RateLimit-Remaining: 95
+      RateLimit-Reset: 767 (seconds until window resets)
+
+  WHY app.use('/api', limiter):
+  - Only rate-limits API routes, not static files (if we had any)
+
+
+─── UPDATED: src/index.js (Entry Point) ──────────────────────────────────────
+
+  const express = require('express');
+  const helmet = require('helmet');
+  const rateLimit = require('express-rate-limit');
+  const app = express();
+  const { serverConfig, Logger } = require('./config');
+  const apirouter = require('./routes');
+  const globalErrorHandler = require('./middlewares/global-error-handler');
+
+  app.use(helmet());                           // Security headers
+  app.use('/api', limiter);                    // Rate limiting
+  app.use(express.json());                     // Body parser
+  app.use(express.urlencoded({ extended: true }));
+  app.use('/api', apirouter);                  // All API routes
+  app.use(globalErrorHandler);                 // Must be LAST
+
+  MIDDLEWARE ORDER MATTERS:
+  1. helmet() → first, sets headers on every response
+  2. limiter → before routes, blocks excess requests early
+  3. express.json() → parses request bodies
+  4. router → handles business logic
+  5. globalErrorHandler → catches any unhandled errors from above
+
+
+─── PHASE 5 TESTING RESULTS ───────────────────────────────────────────────────
+
+  ✅ Server starts with 6 env vars loaded from .env
+  ✅ GET /flights returns data normally (happy path unchanged)
+  ✅ GET /airplanes/99999 → 404 { "Airplane with id 99999 not found" }
+  ✅ POST /cities { "name":"Delhi" } → 400 { "name must be unique" }
+  ✅ POST /airports { cityId:99999 } → 400 { "The referenced city does not exist" }
+  ✅ Helmet headers present (Content-Security-Policy, X-Frame-Options, etc.)
+  ✅ RateLimit-Limit: 100, RateLimit-Remaining: 90 headers present
+  ✅ X-Powered-By header REMOVED (hides Express identity)
+  ✅ Migrations work with config.js: npx sequelize-cli db:migrate --config src/config/config.js
+
+
+================================================================================
+9. PHASE 8 CHANGELOG — API Gateway Features Added to Flight Service
+================================================================================
+
+PHASE 8 GOAL:
+  Add API-gateway-style features directly into the Flight Service so it can
+  act as a production-ready API even before we split into multiple services.
+
+WHAT WAS ADDED:
+  1) CORS
+     - app.use(cors()) added to src/index.js
+     - Allows browser clients from other origins to call the API
+
+  2) Swagger / OpenAPI
+     - src/config/swagger-config.js added
+     - JSDoc annotations added to all route files
+     - Live UI: http://localhost:3000/api-docs
+
+  3) API Key Middleware (Optional)
+     - src/middlewares/api-key-middleware.js
+     - Uses x-api-key header only if API_KEY is set in .env
+     - Allows soft rollout: leave empty to disable enforcement
+
+  4) Request ID Tracing
+     - src/middlewares/request-id-middleware.js
+     - Adds/echoes x-request-id on every request
+
+  5) Enhanced Health Check
+     - src/controllers/info-controller.js
+     - Returns uptime, DB status, memory usage, timestamp
+
+  6) Security Fix: Sort Injection
+     - src/repositories/flight-repository.js
+     - Whitelist sort fields and sort order to prevent SQL injection
+
+UPDATED MIDDLEWARE ORDER (Flight Service):
+  1. attachRequestId
+  2. helmet()
+  3. cors()
+  4. rateLimit
+  5. express.json(), express.urlencoded()
+  6. swagger-ui (api-docs)
+  7. express.static (dashboard UI)
+  8. api-key middleware (if enabled)
+  9. routes
+  10. globalErrorHandler
+
+
+================================================================================
+10. MICROSERVICES ARCHITECTURE — How we split the monolith into services
+================================================================================
+
+FINAL FOLDER STRUCTURE:
+  Desktop/
+  └── Airline-Booking-System/
+      ├── flight-service/   (Port 3000, DB: Flights)
+      ├── booking-service/  (Port 3002, DB: Booking_DB)
+      ├── auth-service/     (Port 3003, DB: Auth_DB)
+      └── api-gateway/      (Port 3001, no DB)
+
+WHY THIS STRUCTURE:
+  - Each service is independent with its own package.json and dependencies
+  - Each service can scale independently
+  - Failures in one service do not crash others
+
+HOW WE MIGRATED:
+  - Copied the existing Flight Service into flight-service/
+  - Created clean projects for Booking, Auth, Gateway
+  - Each service uses its own .env with port + DB config
+
+
+================================================================================
+11. AUTH SERVICE — User signup, login, JWT tokens (line-by-line)
+================================================================================
+
+PORT: 3003
+DB: Auth_DB
+
+KEY FILES:
+  - src/models/user.js
+      Defines User with email, password, role
+      Password is hashed with bcrypt before creation
+
+  - src/services/auth-service.js
+      signup(): validates email uniqueness, creates user
+      login(): compares password, issues JWT
+      verifyToken(): validates JWT
+
+  - src/controllers/auth-controller.js
+      POST /api/v1/signup  → create user
+      POST /api/v1/login   → returns { token, user }
+      GET  /api/v1/verify  → verifies Bearer token
+
+  - src/middlewares/auth-middleware.js
+      Validates signup/login payloads before controller
+
+JWT DESIGN:
+  - Payload: { id, email, role }
+  - Secret: JWT_SECRET (shared with API Gateway)
+  - Expiry: JWT_EXPIRY (default 24h)
+
+
+================================================================================
+12. BOOKING SERVICE — Flight booking with inter-service calls (line-by-line)
+================================================================================
+
+PORT: 3002
+DB: Booking_DB
+
+KEY FILES:
+  - src/models/booking.js
+      Booking: flightId, userId, noOfSeats, totalCost, status
+      Status: pending/booked/confirmed/cancelled
+
+  - src/services/booking-service.js
+      createBooking():
+        1) Calls Flight Service to fetch flight details
+        2) Checks remainingSeats vs requested seats
+        3) Calculates totalCost = price * noOfSeats
+        4) Creates booking record
+        5) Calls Flight Service to decrement seats
+        6) Rolls back booking if seat update fails
+
+      cancelBooking():
+        1) Fetch booking
+        2) Calls Flight Service to add seats back
+        3) Updates status → cancelled
+
+  - src/routes/v1/index.js
+      POST   /api/v1/bookings
+      GET    /api/v1/bookings
+      GET    /api/v1/bookings/:id
+      PATCH  /api/v1/bookings/:id/cancel
+
+
+================================================================================
+13. API GATEWAY — Reverse proxy, JWT middleware, routing (line-by-line)
+================================================================================
+
+PORT: 3001
+DB: None
+
+GOAL:
+  - Single entry point for frontend/clients
+  - Auth enforcement, rate limits, logging
+  - Route requests to downstream services
+
+KEY FILES:
+  - src/middlewares/auth-middleware.js
+      authenticate(): verifies JWT from Authorization header
+      authorizeAdmin(): (optional) restricts admin-only routes
+
+  - src/routes/index.js
+      /api/v1/auth/*     → proxies to Auth Service
+      /api/v1/flights/*  → proxies to Flight Service (read is public)
+      /api/v1/bookings/* → proxies to Booking Service (auth required)
+
+  - src/index.js
+      CORS + Helmet + RateLimit
+      Morgan request logging via Winston
+      /health endpoint for gateway status
+
+
+================================================================================
+14. INTER-SERVICE COMMUNICATION — How services talk to each other
+================================================================================
+
+BOOKING → FLIGHT SERVICE:
+  - GET /api/v1/flights/:id
+      Used to fetch price + remaining seats
+  - PATCH /api/v1/flights/:id/seats
+      Used to decrement seats after booking
+
+GATEWAY → SERVICES:
+  - Proxies traffic via Axios, preserves status codes and responses
+  - Injects userId from JWT into booking payload
+
+DESIGN NOTE:
+  - No DB-level foreign keys across services
+  - All cross-service coordination done via HTTP
+
+
+================================================================================
+15. ALTERNATIVES & TRADE-OFFS — What else we could have done
+================================================================================
+
+ALTERNATIVE 1: True API Gateway with reverse proxy middleware
+  - Use http-proxy-middleware or Nginx
+  - Trade-off: less control over auth injection and per-route logic
+
+ALTERNATIVE 2: Service Mesh (Istio/Linkerd)
+  - Handles retries, timeouts, tracing
+  - Trade-off: heavy infra, not ideal for local dev
+
+ALTERNATIVE 3: Async booking with queue
+  - Booking emits events (Kafka/RabbitMQ)
+  - Trade-off: eventual consistency, more complexity
+
+ALTERNATIVE 4: Centralized user DB with shared schemas
+  - Easier joins, but breaks microservice isolation
+
+
+================================================================================
+16. WHAT COULD GO WRONG — Failure modes and edge cases
+================================================================================
+
+1) Partial failure in booking flow
+   - Booking created but seat update fails
+   - We handle this by rolling back the booking
+
+2) Flight Service down
+   - Booking Service returns 503 with meaningful message
+
+3) JWT mismatch between Auth + Gateway
+   - Tokens fail to verify if JWT_SECRET differs
+   - Fix by keeping secrets aligned in .env
+
+4) Duplicate bookings (race conditions)
+   - Two requests could check seats simultaneously
+   - Needs DB locking or atomic seat updates in Flight Service
+
+5) Booking cancellation after seat update fails
+   - Must ensure flight seat release happens before status change
+
+
+================================================================================
+17. JUNIOR DEVELOPER MISTAKES — Common pitfalls and how to avoid them
+================================================================================
+
+1) Hardcoding service URLs
+   - Always use env variables (FLIGHT_SERVICE_URL, etc.)
+
+2) Skipping rollback on failures
+   - Without rollback, bookings can exist without reserved seats
+
+3) Sharing databases across services
+   - Breaks service isolation and makes scaling harder
+
+4) No auth on booking endpoints
+   - Allows anyone to create bookings for any user
+
+5) Misordered middleware
+   - CORS and rate limiting should run before routes
+
+
+================================================================================
+18. HOW WE BUILT IT — Step-by-step build narrative
+================================================================================
+
+STEP 1: Copied Flight Service into flight-service/
+  - Preserved all existing endpoints and data model
+
+STEP 2: Created Auth Service
+  - Built User model + migration
+  - Added signup/login/verify endpoints
+  - Implemented bcrypt hashing and JWT issuance
+
+STEP 3: Created Booking Service
+  - Built Booking model + migration
+  - Added booking create/cancel/list endpoints
+  - Integrated with Flight Service via HTTP
+
+STEP 4: Created API Gateway
+  - Added JWT verification middleware
+  - Proxied Auth, Flight, Booking routes
+  - Enforced auth for bookings and write operations
+
+STEP 5: End-to-end validation
+  - Login through gateway → JWT issued
+  - Booking through gateway → seats updated in Flight Service
+  - Booking retrieval through gateway → only user bookings returned
+
+
+================================================================================
+10. MICROSERVICES ARCHITECTURE — How we split the monolith into services
+================================================================================
+
+FINAL FOLDER LAYOUT (Desktop/):
+  Airline-Booking-System/
+    ├── flight-service/   (Port 3000, DB: Flights)
+    ├── booking-service/  (Port 3002, DB: Booking_DB)
+    ├── auth-service/     (Port 3003, DB: Auth_DB)
+    └── api-gateway/      (Port 3001, no DB)
+
+WHY WE SPLIT:
+  - Independent scaling: bookings can scale without scaling flights
+  - Fault isolation: one service can go down without taking all down
+  - Clear ownership: each service has one bounded responsibility
+
+HOW THE SERVICES CONNECT:
+  - Clients talk only to API Gateway on port 3001
+  - API Gateway proxies to Flight, Booking, Auth services
+  - Booking Service calls Flight Service directly (HTTP) for seat updates
+
+
+================================================================================
+11. AUTH SERVICE — User signup, login, JWT tokens (line-by-line)
+================================================================================
+
+SERVICE LOCATION:
+  Desktop/Airline-Booking-System/auth-service/
+
+ROLE:
+  - Create users (signup)
+  - Authenticate users (login)
+  - Issue JWT tokens
+  - Verify JWT tokens
+
+KEY FILES AND EXPLANATIONS:
+
+1) src/index.js
+  - Creates Express server on port 3003
+  - Adds helmet, cors, rate-limit
+  - Mounts /api routes
+  - Uses a global error handler
+
+2) src/config/server-config.js
+  - Loads .env from service root
+  - Exposes PORT, JWT_SECRET, JWT_EXPIRY
+
+3) src/config/config.js
+  - Sequelize config for DB credentials
+  - Uses .env via explicit path
+
+4) src/models/user.js
+  - Defines User model with:
+      email (unique, validated as email)
+      password (min length 6)
+      role (user/admin)
+  - beforeCreate hook hashes password with bcrypt
+  - comparePassword method verifies candidate password
+
+5) src/services/auth-service.js
+  signup(data):
+    - checks if email already exists
+    - creates user (password hashed by model hook)
+    - returns safe user fields (no password)
+
+  login(data):
+    - finds user by email
+    - compares password using bcrypt
+    - issues JWT token with { id, email, role }
+
+  verifyToken(token):
+    - verifies token with JWT_SECRET
+    - throws if invalid or expired
+
+6) src/controllers/auth-controller.js
+  POST /api/v1/signup
+  POST /api/v1/login
+  GET  /api/v1/verify
+  - Controllers are thin: validate input, call service, send JSON
+
+7) src/middlewares/auth-middleware.js
+  validateSignupRequest:
+    - ensures email exists and is valid
+    - ensures password length >= 6
+    - validates optional role
+  validateLoginRequest:
+    - ensures email and password exist
+
+REQUEST FLOW (login):
+  POST /api/v1/login
+    → middleware validates email/password
+    → controller calls AuthService.login
+    → service verifies password and returns JWT
+
+
+================================================================================
+12. BOOKING SERVICE — Flight booking with inter-service calls (line-by-line)
+================================================================================
+
+SERVICE LOCATION:
+  Desktop/Airline-Booking-System/booking-service/
+
+ROLE:
+  - Create bookings
+  - Cancel bookings
+  - Query bookings by user
+  - Call Flight Service to verify seats and update inventory
+
+KEY FILES AND EXPLANATIONS:
+
+1) src/models/booking.js
+  - Booking model fields:
+      flightId, userId, noOfSeats, totalCost, status
+  - No foreign keys (cross-service DBs should not link directly)
+
+2) src/services/booking-service.js
+  createBooking(data):
+    1. Calls Flight Service GET /flights/:id
+    2. Checks remainingSeats vs noOfSeats
+    3. Calculates totalCost = price * noOfSeats
+    4. Creates booking record
+    5. Calls Flight Service PATCH /flights/:id/seats
+    6. If seat update fails, booking is rolled back (delete)
+
+  cancelBooking(bookingId):
+    1. Fetch booking
+    2. Calls Flight Service to add seats back
+    3. Updates booking status to cancelled
+
+3) src/controllers/booking-controller.js
+  POST /api/v1/bookings
+  GET  /api/v1/bookings
+  GET  /api/v1/bookings/:id
+  PATCH /api/v1/bookings/:id/cancel
+  - Uses BookingService for all operations
+
+4) src/middlewares/booking-middleware.js
+  validateCreateBooking:
+    - flightId must be positive int
+    - userId must be positive int
+    - noOfSeats must be >= 1
+
+REQUEST FLOW (create booking):
+  POST /api/v1/bookings
+    → middleware validates flightId/userId/noOfSeats
+    → controller calls BookingService.createBooking
+    → service calls Flight Service for seat check
+    → booking created and seats updated
+
+
+================================================================================
+13. API GATEWAY — Reverse proxy, JWT middleware, routing (line-by-line)
+================================================================================
+
+SERVICE LOCATION:
+  Desktop/Airline-Booking-System/api-gateway/
+
+ROLE:
+  - Single entry point for all clients
+  - Enforces JWT authentication
+  - Routes requests to the correct service
+
+KEY FILES AND EXPLANATIONS:
+
+1) src/index.js
+  - Adds helmet, cors, rate-limit
+  - Adds request logging with morgan + winston
+  - Exposes /health endpoint
+  - Mounts /api/v1 routes
+
+2) src/middlewares/auth-middleware.js
+  authenticate(req, res, next):
+    - reads Authorization: Bearer <token>
+    - verifies token with JWT_SECRET
+    - attaches req.user = decoded token
+
+  authorizeAdmin(req, res, next):
+    - checks req.user.role === 'admin'
+    - optional for admin-only routes
+
+3) src/routes/index.js
+  AUTH ROUTES:
+    POST /api/v1/auth/signup → Auth Service
+    POST /api/v1/auth/login  → Auth Service
+
+  FLIGHT ROUTES:
+    Public: GET /flights, /cities, /airports, /airplanes
+    Protected: POST/PATCH/DELETE endpoints
+
+  BOOKING ROUTES:
+    All protected
+    Gateway injects userId from JWT into booking payload
+
+REQUEST FLOW (booking via gateway):
+  Client → POST /api/v1/bookings
+    → Gateway verifies JWT
+    → Gateway injects userId into body
+    → Booking Service executes createBooking
+
+
+================================================================================
+14. INTER-SERVICE COMMUNICATION — How services talk to each other
+================================================================================
+
+BOOKING → FLIGHT SERVICE:
+  - GET /api/v1/flights/:id (check price + remainingSeats)
+  - PATCH /api/v1/flights/:id/seats (reserve/release seats)
+
+GATEWAY → SERVICES:
+  - Proxies to Auth, Flight, Booking using Axios
+  - Preserves downstream status codes
+  - Injects userId for booking creation
+
+WHY HTTP INSTEAD OF DIRECT DB QUERIES:
+  - Keeps service boundaries intact
+  - Allows services to scale independently
+  - Prevents accidental cross-service coupling
+
+
+================================================================================
+15. ALTERNATIVES & TRADE-OFFS — What else we could have done
+================================================================================
+
+ALTERNATIVE 1: Nginx/Kong Gateway
+  - Pros: production-grade, rate limiting, routing, plugins
+  - Cons: more infrastructure, slower iteration during dev
+
+ALTERNATIVE 2: Service Mesh (Istio/Linkerd)
+  - Pros: retries, tracing, observability built-in
+  - Cons: heavy setup, not ideal for local learning
+
+ALTERNATIVE 3: Event-driven Booking (Kafka/RabbitMQ)
+  - Pros: resilient, async, scalable
+  - Cons: eventual consistency, more moving parts
+
+ALTERNATIVE 4: Shared Auth Library
+  - Pros: no Gateway JWT verification needed
+  - Cons: increases coupling between services
+
+
+================================================================================
+16. WHAT COULD GO WRONG — Failure modes and edge cases
+================================================================================
+
+1) Seat race condition
+  - Two bookings for same flight can overlap
+  - Fix: atomic seat update or DB row locks in Flight Service
+
+2) Partial booking failure
+  - Booking created but seat update fails
+  - We roll back booking to avoid inconsistent state
+
+3) JWT secret mismatch
+  - Gateway and Auth Service must use same JWT_SECRET
+  - If different, all requests fail auth
+
+4) Flight Service down
+  - Booking Service returns 503
+  - Gateway returns downstream error
+
+5) Duplicate user signup
+  - Auth Service returns 409 Conflict
+
+
+================================================================================
+17. JUNIOR DEVELOPER MISTAKES — Common pitfalls and how to avoid them
+================================================================================
+
+1) Putting business logic in controllers
+  - Controllers should call services, not manipulate DB directly
+
+2) Sharing DBs between services
+  - Breaks isolation and makes scaling risky
+
+3) No rollback on failure
+  - Always roll back booking if seat update fails
+
+4) Forgetting auth on write routes
+  - Gateway should protect POST/PATCH/DELETE routes
+
+5) Hardcoding service URLs
+  - Always use .env values in config
+
+
+================================================================================
+18. HOW WE BUILT IT — Step-by-step build narrative
+================================================================================
+
+STEP 1: Copied Flight Service into flight-service/
+  - Preserved existing models, routes, docs, and logs
+
+STEP 2: Built Auth Service
+  - Added User model + migration
+  - Implemented signup/login/verify
+  - Added bcrypt + JWT
+
+STEP 3: Built Booking Service
+  - Added Booking model + migration
+  - Implemented create/cancel endpoints
+  - Added inter-service calls to Flight Service
+
+STEP 4: Built API Gateway
+  - Added JWT middleware
+  - Routed Auth, Flight, Booking paths
+  - Added /health endpoint and logging
+
+STEP 5: End-to-end tests
+  - Login via gateway → token issued
+  - Create booking via gateway → seats updated
+  - Fetch bookings via gateway → user-specific data returned
+
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================
